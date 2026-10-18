@@ -149,10 +149,10 @@ static float3 spaceAt(float2 uv, float2 head, constant Uniforms& u)
     float t = u.time;
 
     // The camera looks at the black hole from slightly above its disk; the hole sits at (bhX, bhY).
-    float2 bh = float2(u.bhX + 0.012 * sin(t * 0.07), u.bhY + 0.008 * sin(t * 0.05 + 1.0));
+    float2 bh = float2(u.bhX, u.bhY);
     float2 offs = float2((uv.x - bh.x) * aspect, bh.y - uv.y) * 2.0 * tanV;
     float elev = u.bhElev + 0.025 * sin(t * 0.11);
-    const float D = 25.0;
+    float D = u.bhDist;
     float3 C = D * float3(0.0, sin(elev), -cos(elev));
     float3 f = normalize(-C);
     float3 right = normalize(cross(float3(0.0, 1.0, 0.0), f));

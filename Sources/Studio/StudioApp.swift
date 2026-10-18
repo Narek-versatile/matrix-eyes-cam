@@ -13,6 +13,19 @@ struct StudioApp: App {
                 .onAppear { model.start() }
         }
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandMenu("Look") {
+                Button("Next Look") { model.look.next() }.keyboardShortcut("]")
+                Button("Previous Look") { model.look.next(-1) }.keyboardShortcut("[")
+                Divider()
+                Button(model.preset.blackHole ? "Hide Black Hole" : "Show Black Hole") {
+                    model.look.update { $0.blackHole.toggle() }
+                }
+                .keyboardShortcut("b")
+                .disabled(model.preset.background != .space)
+                Button("Take Photo") { model.takePhoto() }.keyboardShortcut("s", modifiers: [.command, .shift])
+            }
+        }
 
         // A borderless view of exactly what the call receives (for screen-capture tools like OBS).
         Window("Output", id: "output") {
@@ -36,9 +49,9 @@ struct MenuBarContent: View {
     var body: some View {
         Text("Virtual camera: \(model.virtualCamera.text)")
         Divider()
-        ForEach(model.store.presets) { p in
+        ForEach(model.look.store.presets) { p in
             Button {
-                model.select(p.id)
+                model.look.select(p.id)
             } label: {
                 if p.id == model.preset.id { Label(p.name, systemImage: "checkmark") } else { Text(p.name) }
             }
@@ -67,7 +80,7 @@ struct PreviewView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: MTKView, context: Context) {
-        context.coordinator.mirror = mirror ?? model.mirrorPreview
+        context.coordinator.mirror = mirror ?? model.preset.mirror
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(model: model) }

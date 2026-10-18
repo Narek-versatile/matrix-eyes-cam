@@ -42,6 +42,7 @@ struct Uniforms {
     float bhTanV;            // vertical tan(half fov) of the black-hole camera
     float bhElev;            // that camera's elevation above the accretion disk, radians
     float matrixLook;        // 1 for the Matrix styles
+    float bhDist;            // camera distance from the black hole (smaller = bigger hole)
 };
 
 struct CompositeParams {

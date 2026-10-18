@@ -8,6 +8,8 @@ import Vision
 /// Output is an r8 mask the size of Vision's result: 1 = person.
 final class PersonMasker {
     private let request = VNGeneratePersonSegmentationRequest()
+    private let faces = VNDetectFaceRectanglesRequest()
+    private var latestFaceRect: CGRect?
     private let device: MTLDevice
     private let queue = DispatchQueue(label: "matrix-eyes.mask", qos: .userInitiated)
     private let lock = NSLock()
@@ -25,6 +27,13 @@ final class PersonMasker {
         lock.lock()
         defer { lock.unlock() }
         return latest
+    }
+
+    /// The largest face, in camera-image coordinates (0...1, origin top-left, unmirrored).
+    func latestFace() -> CGRect? {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestFaceRect
     }
 
     /// Non-blocking; drops the frame if the previous one is still being processed.
@@ -52,7 +61,7 @@ final class PersonMasker {
 
     private func run(_ handler: VNImageRequestHandler) -> MTLTexture? {
         let start = CACurrentMediaTime()
-        guard (try? handler.perform([request])) != nil,
+        guard (try? handler.perform([request, faces])) != nil,
               let pb = (request.results?.first as? VNPixelBufferObservation)?.pixelBuffer,
               CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_OneComponent8
         else { return nil }
@@ -66,6 +75,13 @@ final class PersonMasker {
         guard let tex = device.makeTexture(descriptor: desc) else { return nil }
         tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0,
                     withBytes: base, bytesPerRow: CVPixelBufferGetBytesPerRow(pb))
+        if let face = faces.results?.max(by: { $0.boundingBox.width < $1.boundingBox.width }) {
+            let b = face.boundingBox                                        // Vision: origin bottom-left
+            let rect = CGRect(x: b.minX, y: 1 - b.maxY, width: b.width, height: b.height)
+            lock.lock()
+            latestFaceRect = rect
+            lock.unlock()
+        }
         lastInferenceMs = (CACurrentMediaTime() - start) * 1000
         return tex
     }

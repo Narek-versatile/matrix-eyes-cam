@@ -5,17 +5,16 @@ import Metal
 import MetalKit
 import SwiftUI
 
-/// Owns the camera, the analysis (cut-out, depth), the engine and the active look.
+/// Owns the camera, the analysis (cut-out, depth), the engine, the look and the virtual camera.
 @MainActor
 final class StudioModel: ObservableObject {
-    let store = PresetStore()
-    @Published private(set) var preset: Preset
+    let look = LookModel(folder: "Matrix Eyes Cam", defaultLook: "Silver Surfer in space")
     @Published var cameraProblem: String?
-    @Published var mirrorPreview = true
     @Published private(set) var framesPerSecond: Double = 0
     @Published var virtualCamera = VirtualCameraStatus.notInstalled
     @Published var installMessage: String?
-    private let installer = ExtensionInstaller()
+    @Published var countdown: Int?
+    @Published var toast: String?
 
     let device: MTLDevice?
     let engine: Engine?
@@ -24,13 +23,17 @@ final class StudioModel: ObservableObject {
     private let camera = Camera()
     private var depth: DepthEstimator?
     private var masker: PersonMasker?
+    private let installer = ExtensionInstaller()
     private let renderQueue = DispatchQueue(label: "matrix-eyes-cam.render", qos: .userInteractive)
     private var timer: DispatchSourceTimer?
     private var frameTimes: [Double] = []
+    private var countdownToken = 0
+    private var cancellables: Set<AnyCancellable> = []
     var output: VirtualCameraOutput?
 
+    var preset: Preset { look.preset }
+
     init() {
-        preset = store.active
         device = MTLCreateSystemDefaultDevice()
         guard let device else {
             engine = nil
@@ -38,15 +41,27 @@ final class StudioModel: ObservableObject {
             return
         }
         do {
-            engine = try Engine(device: device, preset: store.active)
+            engine = try Engine(device: device, preset: look.preset)
             startupError = nil
         } catch {
             engine = nil
             startupError = "Couldn't start the renderer: \(error)"
             return
         }
+        engine?.mirrorsPicture = false          // calls always get the true picture
         depth = try? DepthEstimator(device: device)
         masker = PersonMasker(device: device)
+        look.depthAvailable = depth != nil
+        look.onChange = { [weak self] p, animated in
+            guard let self else { return }
+            let mediaChanged = p.mediaPath != self.engine?.preset.mediaPath
+            self.engine?.setPreset(p, animated: animated)
+            if mediaChanged { self.loadMedia() }
+        }
+        look.takePhoto = { [weak self] in self?.takePhoto() }
+        look.askForPhotoFolder = { [weak self] done in self?.askForPhotoFolder(done) }
+        // re-publish the look's changes so views observing the studio update too
+        look.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
         loadMedia()
     }
 
@@ -63,10 +78,11 @@ final class StudioModel: ObservableObject {
             engine.cameraFrame = { [camera] in camera.latest() }
             engine.depthFrame = { depth?.latestTexture() }
             engine.maskFrame = { masker?.latestTexture() }
+            engine.faceRect = { masker?.latestFace() }
             camera.onPixelBuffer = { [weak engine] buffer in
                 guard let engine else { return }
                 let p = engine.preset
-                masker?.submit(buffer)
+                if p.needsMask || (p.holeActive && p.holeMotion == .orbit) { masker?.submit(buffer) }
                 if p.needsDepth { depth?.submit(buffer) }
             }
             camera.onProblem = { [weak self] message in self?.cameraProblem = message }
@@ -91,56 +107,6 @@ final class StudioModel: ObservableObject {
         timer = t
     }
 
-    private func useTestImage(_ path: String, device: MTLDevice, engine: Engine) {
-        let url = URL(fileURLWithPath: path)
-        guard let tex = try? MTKTextureLoader(device: device).newTexture(URL: url, options: [.SRGB: false, .origin: MTKTextureLoader.Origin.topLeft]),
-              let src = CGImageSourceCreateWithURL(url as CFURL, nil), let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return }
-        engine.cameraFrame = { (tex, nil) }
-        let mask = masker?.estimate(cg)
-        let depthTex = depth?.estimate(cg)
-        engine.maskFrame = { mask }
-        engine.depthFrame = { depthTex }
-    }
-
-    /// Developer check (MATRIX_CAM_SNAPSHOTS=dir): switches through a few looks in the running app,
-    /// saving each call frame and the controls panel as PNGs, then quits. Saved looks are untouched.
-    private func runSnapshots(into dir: String) {
-        let looks = Array(store.presets.prefix(5))
-        let original = store.activeID
-        for (i, look) in looks.enumerated() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5 + Double(i) * 1.6) { [weak self] in
-                guard let self else { return }
-                self.preset = look
-                self.engine?.preset = look
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3.6 + Double(i) * 1.6) { [weak self] in
-                guard let self, let frame = self.engine?.latest(), let image = Engine.image(from: frame) else { return }
-                Self.writePNG(image, to: "\(dir)/frame-\(i).png")
-                if let panel = self.renderControls() { Self.writePNG(panel, to: "\(dir)/controls-\(i).png") }
-                FileHandle.standardError.write(Data("snapshot \(i): \(look.name), fps \(Int(self.framesPerSecond)), camera: \(self.virtualCamera.text)\n".utf8))
-            }
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.5 + Double(looks.count) * 1.6) { [weak self] in
-            self?.store.select(original)
-            NSApp.terminate(nil)
-        }
-    }
-
-    private func renderControls() -> CGImage? {
-        let host = NSHostingView(rootView: ControlsView().environmentObject(self).frame(width: 360, height: 900).preferredColorScheme(.dark))
-        host.frame = NSRect(x: 0, y: 0, width: 360, height: 900)
-        host.layoutSubtreeIfNeeded()
-        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return nil }
-        host.cacheDisplay(in: host.bounds, to: rep)
-        return rep.cgImage
-    }
-
-    private static func writePNG(_ image: CGImage, to path: String) {
-        guard let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, "public.png" as CFString, 1, nil) else { return }
-        CGImageDestinationAddImage(dest, image, nil)
-        CGImageDestinationFinalize(dest)
-    }
-
     private func tick(_ now: Double) {
         frameTimes.append(now)
         frameTimes.removeAll { now - $0 > 1 }
@@ -152,50 +118,122 @@ final class StudioModel: ObservableObject {
         installer.install()
     }
 
-    // MARK: - Looks
-
-    func update(_ change: (inout Preset) -> Void) {
-        var p = preset
-        change(&p)
-        let mediaChanged = p.mediaPath != preset.mediaPath
-        preset = p
-        engine?.preset = p
-        store.active = p
-        if mediaChanged { loadMedia() }
-    }
-
-    func select(_ id: UUID) {
-        store.select(id)
-        preset = store.active
-        engine?.preset = preset
-        loadMedia()
-    }
-
-    func saveAsNew(named name: String) {
-        store.saveCopy(named: name)
-        preset = store.active
-    }
-
-    func deleteActive() {
-        store.delete(preset.id)
-        select(store.activeID)
-    }
-
     private func loadMedia() {
-        guard let device, let path = preset.mediaPath else { engine?.media = nil; return }
+        guard let device, let path = look.preset.mediaPath else { engine?.media = nil; return }
         engine?.media = MediaSource(url: URL(fileURLWithPath: path), device: device)
     }
 
-    func chooseMedia() {
-        let panel = NSOpenPanel()
-        panel.title = "Fill your silhouette with…"
-        panel.allowedContentTypes = [.image, .movie, .mpeg4Movie, .quickTimeMovie]
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        update {
-            $0.mediaPath = url.path
-            $0.subject = .fill
-            $0.fill = .media
+    // MARK: - Photos
+
+    func takePhoto() {
+        let seconds = look.photoTimer
+        guard seconds > 0 else { shoot(); return }
+        countdownToken += 1
+        let token = countdownToken
+        func tick(_ n: Int) {
+            guard token == countdownToken else { return }
+            if n == 0 {
+                countdown = nil
+                shoot()
+                return
+            }
+            countdown = n
+            NSSound(named: "Tink")?.play()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { tick(n - 1) }
         }
+        tick(seconds)
+    }
+
+    func cancelCountdown() {
+        countdownToken += 1
+        countdown = nil
+    }
+
+    private func shoot() {
+        NSSound(contentsOfFile: "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/Shutter.aif",
+                byReference: true)?.play()
+        guard let frame = engine?.latest(), let image = Engine.image(from: frame) else { return }
+        let lookName = look.preset.name
+        if let folder = look.photos.folder {
+            store(image, in: folder, look: lookName)
+        } else {
+            askForPhotoFolder { [weak self] folder in
+                if let folder { self?.store(image, in: folder, look: lookName) } else { self?.showToast("Photo not saved") }
+            }
+        }
+    }
+
+    private func store(_ image: CGImage, in folder: URL, look name: String) {
+        do {
+            _ = try look.photos.write(image, in: folder, look: name)
+            showToast("Photo saved to \(folder.lastPathComponent)")
+        } catch {
+            showToast("Couldn't save there; pick another folder")
+            askForPhotoFolder { [weak self] new in
+                if let new { self?.store(image, in: new, look: name) }
+            }
+        }
+    }
+
+    private func askForPhotoFolder(_ done: @escaping (URL?) -> Void) {
+        look.photos.chooseFolder(over: NSApp.keyWindow) { [weak self] url in
+            self?.look.refreshPhotoFolder()
+            done(url)
+        }
+    }
+
+    private func showToast(_ text: String) {
+        toast = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            if self?.toast == text { self?.toast = nil }
+        }
+    }
+
+    // MARK: - Developer checks
+
+    private func useTestImage(_ path: String, device: MTLDevice, engine: Engine) {
+        let url = URL(fileURLWithPath: path)
+        guard let tex = try? MTKTextureLoader(device: device).newTexture(URL: url, options: [.SRGB: false, .origin: MTKTextureLoader.Origin.topLeft]),
+              let src = CGImageSourceCreateWithURL(url as CFURL, nil), let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return }
+        engine.cameraFrame = { (tex, nil) }
+        let mask = masker?.estimate(cg)
+        let depthTex = depth?.estimate(cg)
+        let masker = self.masker
+        engine.maskFrame = { mask }
+        engine.depthFrame = { depthTex }
+        engine.faceRect = { masker?.latestFace() }
+    }
+
+    /// MATRIX_CAM_SNAPSHOTS=dir: switches through a few looks in the running app, saving each
+    /// frame and the controls panel as PNGs, then quits. Saved looks are untouched.
+    private func runSnapshots(into dir: String) {
+        let looks = [2, 16, 0, 11, 13].compactMap { $0 < look.store.presets.count ? look.store.presets[$0] : nil }
+        for (i, item) in looks.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5 + Double(i) * 1.8) { [weak self] in
+                self?.look.select(item.id)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.9 + Double(i) * 1.8) { [weak self] in
+                guard let self, let frame = self.engine?.latest(), let image = Engine.image(from: frame) else { return }
+                Self.writePNG(image, to: "\(dir)/frame-\(i).png")
+                if let panel = self.renderControls() { Self.writePNG(panel, to: "\(dir)/controls-\(i).png") }
+                FileHandle.standardError.write(Data("snapshot \(i): \(item.name), fps \(Int(self.framesPerSecond)), camera: \(self.virtualCamera.text)\n".utf8))
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.8 + Double(looks.count) * 1.8) { NSApp.terminate(nil) }
+    }
+
+    private func renderControls() -> CGImage? {
+        let host = NSHostingView(rootView: ControlsView().environmentObject(self).frame(width: 360, height: 1400).preferredColorScheme(.dark))
+        host.frame = NSRect(x: 0, y: 0, width: 360, height: 1400)
+        host.layoutSubtreeIfNeeded()
+        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return nil }
+        host.cacheDisplay(in: host.bounds, to: rep)
+        return rep.cgImage
+    }
+
+    private static func writePNG(_ image: CGImage, to path: String) {
+        guard let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, "public.png" as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(dest, image, nil)
+        CGImageDestinationFinalize(dest)
     }
 }

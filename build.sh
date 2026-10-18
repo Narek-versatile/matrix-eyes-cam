@@ -19,9 +19,15 @@ swiftc -O -swift-version 5 -target arm64-apple-macos14.0 ${FLAGS[@]+"${FLAGS[@]}
 cp Info.plist "$APP/Contents/Info.plist"
 cp Resources/Shaders/*.msl Resources/AppIcon.icns "$APP/Contents/Resources/"
 
-# Depth model: reuse Matrix Eyes' copy (or fetch it), compile once.
-MODEL=../Models/DepthAnythingV2SmallF16.mlpackage
-[ -d "$MODEL" ] || ../scripts/fetch-model.sh
+# Depth model: fetched into Models/ (or reused from a Matrix Eyes checkout next door), compiled once.
+MODEL=Models/DepthAnythingV2SmallF16.mlpackage
+if [ ! -d "$MODEL" ]; then
+    if [ -d ../Models/DepthAnythingV2SmallF16.mlpackage ]; then
+        MODEL=../Models/DepthAnythingV2SmallF16.mlpackage
+    else
+        scripts/fetch-model.sh
+    fi
+fi
 mkdir -p build
 if [ ! -d build/DepthAnythingV2SmallF16.mlmodelc ]; then
     xcrun coremlcompiler compile "$MODEL" build/ >/dev/null

@@ -10,7 +10,8 @@ A virtual webcam for Google Meet (and Zoom, FaceTime, anything that picks a came
 | Signing | A friend's paid Apple Developer account (needed for the camera extension; see "Signing") |
 | Silhouette options | Real you with effects, Matrix Eyes material looks, fill with image/video/animated texture, face-tracked avatars |
 | Backgrounds | Endlessly animated "impossible" 3D spaces, animated scenes, blur / tidy room |
-| Output | 1280×720 at 30 fps (1080p optional), sent **unmirrored** so text reads correctly for others; the studio preview is mirrored like a mirror |
+| Output | 1280×720 at 30 fps (1080p optional), sent **unmirrored** so text reads correctly for others; the studio preview can be mirrored like a mirror |
+| Relation to Matrix Eyes | Two apps, one engine: `Sources/Engine` + `Resources/Shaders` are shared (developed here, copied by `scripts/sync-to-matrix-eyes.sh`), with the same settings panel in both; each app keeps its own saved looks |
 
 ## Architecture
 
@@ -24,13 +25,14 @@ camera (AVFoundation) ─┬─ person mask + face position (Vision)       ┐
   1. *Background layer*: the room (as is / blurred / tidied) or a generated scene. Generated 3D scenes follow your head position (face tracking), so the background behaves like a window instead of a flat picture.
   2. *Subject layer*: your cut-out, kept as you are or turned into something else, with soft edges.
   3. *Composite*: subject over background with light wrap (background light bleeding onto your edges), trails, final grade.
-- **Studio app** (`Sources/Studio`): live preview of exactly what the call sees, background / silhouette pickers with their parameters, presets, menu bar quick-switch. Presets are stored in Application Support; the active one is applied automatically when the camera starts.
+- **Studio app** (`Sources/Studio`): live preview of exactly what the call sees, the shared settings panel (`Sources/Engine/LookModel.swift`), presets, photos, menu bar quick-switch. Presets are stored in Application Support; the active one is applied automatically when the camera starts.
 - **Camera extension** (`Sources/Extension`): exposes the virtual camera. It has a *source* stream (what Meet reads) and a *sink* stream that the Studio app writes rendered frames into. When the app isn't sending, the camera shows a "open Matrix Eyes Cam" card.
 
 ## Phases
 
 1. **Engine + Studio app** (no signing needed): all backgrounds and silhouette modes except avatars, presets, live preview, clean output window. **Done.**
-2. **Virtual camera**: extension + sink stream + install/activation flow, project generated with XcodeGen. **Built and compiles (unsigned Xcode build verified); loading it needs signing.**
+2. **Virtual camera**: extension + sink stream + install/activation flow, project generated with XcodeGen. **Done: signed with the friend's team, working in Meet.**
+2b. **One engine with Matrix Eyes**: unified looks (21 presets), one settings panel in both apps, the black hole acting on you (bends, pulls in, lights; drag or orbit your head), photos with a timer. **Done.**
 3. **Face-tracked avatars**: characters driven by Vision face landmarks (head turn, mouth, blinks). Next.
 4. **Distribution**: Developer ID signing + notarization, installer, README, release.
 
@@ -51,7 +53,8 @@ Using a friend's account works technically, but the app is then published under 
 | Room | camera as is |
 | Blurred room | background-only blur (no halo around you) |
 | Tidy room | blur + desaturate + darken: a calm "studio" look |
-| Space | starfield, optional ray-traced black hole (from Matrix Eyes) |
+| Room in your look | the whole picture in the silhouette's look (Matrix Eyes' classic mode) |
+| Space | starfield, optional ray-traced black hole that bends, pulls in and lights you |
 | Matrix rain | digital rain |
 | Aurora | night sky, aurora curtains, mountains |
 | Synthwave | neon grid and sun |

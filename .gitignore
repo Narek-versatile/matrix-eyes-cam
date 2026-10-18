@@ -3,3 +3,6 @@
 /MatrixEyesCam.xcodeproj/
 Signing.local.xcconfig
 .DS_Store
+
+# Depth model (48 MB), fetched by scripts/fetch-model.sh
+/Models/

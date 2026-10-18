@@ -5,7 +5,8 @@
 struct CamParams {
     float time;
     float bgKind;        // 0 room, 1 blurred room, 2 tidy room, 3 space, 4 matrix rain, 5 aurora,
-                         // 6 synthwave, 7 infinite corridor, 8 escher stairs, 9 fractal cathedral
+                         // 6 synthwave, 7 infinite corridor, 8 escher stairs, 9 fractal cathedral,
+                         // 10 the whole room in your look (no cut-out)
     float bgSpeed;
     float bgBlackHole;
     float bgDim;         // tidy room: how far the room is calmed down
@@ -22,9 +23,52 @@ struct CamParams {
     float hasMedia;
     float mediaAspect;
     float trailDecay;
+    float holeOn;        // the black hole is in the picture
+    float holeX, holeY;  // its centre on screen
+    float holeBend;      // gravity bends your silhouette near it
+    float holePull;      // wisps of you spiral into it
+    float holeLight;     // the disk lights the side of you facing it
+    float glow;          // glow strength for this look
+    float fade;          // dips to black when the look changes
+    float vignette;
 };
 
 static float3 accentOf(constant CamParams& cp) { return float3(cp.accentR, cp.accentG, cp.accentB); }
+
+// ---- the black hole, as seen on screen --------------------------------------
+struct Hole {
+    float2 c;        // centre (uv)
+    float rs;        // shadow radius, in screen heights
+    float rd;        // outer edge of the accretion disk, in screen heights
+    float aspect;
+    bool on;
+};
+
+static Hole holeOf(constant Uniforms& u, constant CamParams& cp) {
+    Hole h;
+    h.c = float2(cp.holeX, cp.holeY);
+    h.aspect = u.resX / u.resY;
+    // the hole's shadow spans about 2.6 Schwarzschild radii; the disk reaches ~8 (see Space.msl)
+    h.rs = (2.6 / u.bhDist) / (2.0 * u.bhTanV);
+    h.rd = (8.0 / u.bhDist) / (2.0 * u.bhTanV);
+    h.on = cp.holeOn > 0.5;
+    return h;
+}
+
+/// Offset from the hole's centre in screen heights (so circles stay circles).
+static float2 holeVec(float2 uv, Hole h) { return float2((uv.x - h.c.x) * h.aspect, uv.y - h.c.y); }
+
+/// Gravitational lensing of your silhouette: the point-lens mapping beta = theta - thetaE^2/theta.
+/// Near the hole you are stretched around it, as far out as `bend` reaches.
+static float2 bendAround(float2 uv, Hole h, float bend) {
+    float2 d = holeVec(uv, h);
+    float r2 = max(dot(d, d), 1e-6);
+    float thetaE = h.rs * (1.0 + 1.6 * bend);
+    // fade the (physically endless) 1/r tail out beyond the disk, so only what's near the hole bends
+    float reach = exp(-r2 / pow(h.rs * 2.8, 2.0));
+    float2 src = d - d * (thetaE * thetaE * bend / r2) * reach;
+    return h.c + float2(src.x / h.aspect, src.y);
+}
 static float luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 static float3 displayTone(float3 hdr) { return pow(aces(hdr), float3(1.0 / 2.2)); }
 
@@ -459,13 +503,17 @@ fragment float4 camSubjectFS(VOut in [[stage_in]],
                              sampler s [[sampler(0)]],
                              sampler glyphSampler [[sampler(1)]])
 {
-    float2 uv = in.uv;
+    float2 uv0 = in.uv;
+    Hole hole = holeOf(u, cp);
+    // gravity: sample yourself through the hole's lens
+    float2 uv = hole.on && cp.holeBend > 0.001 ? bendAround(uv0, hole, cp.holeBend) : uv0;
     float2 res = float2(u.resX, u.resY);
     float2 px = uv * res;
     float aspect = u.resX / u.resY;
     float2 ct = texUV(dispUV(uv, u), u);
-    float m = cp.maskOn > 0.5 ? mask.sample(s, ct).r : 1.0;
-    float a = cp.maskOn > 0.5 ? smoothstep(0.3, 0.7, m) : 1.0;
+    bool whole = cp.bgKind > 9.5;                                // the whole room takes your look
+    float m = (!whole && cp.maskOn > 0.5) ? mask.sample(s, ct).r : 1.0;
+    float a = (!whole && cp.maskOn > 0.5) ? smoothstep(0.3, 0.7, m) : 1.0;
     float3 camc = cam.sample(s, ct).rgb;
     float3 accent = accentOf(cp);
     int mode = int(cp.subjMode + 0.5);
@@ -532,7 +580,27 @@ fragment float4 camSubjectFS(VOut in [[stage_in]],
     } else if (mode == 4) {                                  // Matrix code
         float cov;
         float3 mc = matrixCodeColor(uv, 1.0, u.depthFade, u, lum, atlas, geo, s, glyphSampler, cov);
-        col = 1.0 - exp(-mc * 2.4);        // brighter than in Matrix Eyes: there's no glow pass here
+        col = 1.0 - exp(-mc * 1.25);       // Matrix Eyes' curve; the glow pass adds the rest
+    }
+    if (hole.on) {
+        float2 d = holeVec(uv0, hole);
+        float r = length(d);
+        // nothing of you survives inside the shadow
+        a *= smoothstep(hole.rs * 0.9, hole.rs * 1.3, r);
+        if (cp.holeLight > 0.001 && a > 0.001) {
+            // the disk's warm light, strongest on the edge of your silhouette that faces it
+            float2 o = float2(10.0, 10.0) * max(u.resY / 720.0, 1.0) / float2(u.resX, u.resY);
+            float gx = mask.sample(s, texUV(dispUV(uv + float2(o.x, 0.0), u), u)).r - mask.sample(s, texUV(dispUV(uv - float2(o.x, 0.0), u), u)).r;
+            float gy = mask.sample(s, texUV(dispUV(uv + float2(0.0, o.y), u), u)).r - mask.sample(s, texUV(dispUV(uv - float2(0.0, o.y), u), u)).r;
+            float2 g = float2(gx, gy);
+            float edge = whole ? 0.0 : saturate(length(g) * 3.0);
+            float2 outward = length(g) > 1e-4 ? -normalize(g) : float2(0.0);
+            float facing = saturate(dot(outward, normalize(-d)));
+            float falloff = 1.0 / (1.0 + pow(r / (hole.rd * 1.8), 2.0));
+            float light = cp.holeLight * falloff;
+            // a warm wash over you, and a bright rim on the edge that faces the hole
+            col = col * (1.0 + float3(0.55, 0.32, 0.12) * light) + float3(1.0, 0.7, 0.4) * light * (0.06 + 1.6 * facing * edge);
+        }
     }
     return float4(col, a);
 }
@@ -552,13 +620,15 @@ fragment float4 camTrailFS(VOut in [[stage_in]],
 }
 
 // ===========================================================================
-// Final picture: background, trails, then you, with background light wrapping onto your edges.
+// Composite: background, trails, then you (with background light wrapping onto your edges),
+// and wisps of you spiralling into the black hole.
 
 fragment float4 camCompositeFS(VOut in [[stage_in]],
                                texture2d<float> background [[texture(0)]],
                                texture2d<float> subject [[texture(1)]],
                                texture2d<float> trail [[texture(2)]],
                                texture2d<float> bgSoft [[texture(3)]],
+                               constant Uniforms& u [[buffer(0)]],
                                constant CamParams& cp [[buffer(1)]],
                                sampler s [[sampler(0)]])
 {
@@ -569,7 +639,74 @@ fragment float4 camCompositeFS(VOut in [[stage_in]],
     float3 soft = bgSoft.sample(s, in.uv).rgb;
     float wrap = cp.lightWrap * sj.a * (1.0 - smoothstep(0.55, 1.0, sj.a));
     float3 subj = mix(sj.rgb, soft, wrap);
-    return float4(mix(bg, subj, sj.a), 1.0);
+    float3 outc = mix(bg, subj, sj.a);
+
+    Hole h = holeOf(u, cp);
+    if (h.on && cp.holePull > 0.001) {
+        float2 d = holeVec(in.uv, h);
+        float r = length(d);
+        if (r > h.rs * 0.95 && r < h.rd * 3.0) {
+            // Follow the inflow backwards (outward along a spiral) and collect whatever of you is there.
+            float th = atan2(d.y, d.x);
+            float3 acc = float3(0.0);
+            float wsum = 0.0;
+            for (int i = 1; i <= 10; i++) {
+                float fs = float(i) * 0.085;
+                float rr = r * exp(fs);
+                float tt = th + fs * 2.4;
+                float2 q = h.c + float2(cos(tt) * rr / h.aspect, sin(tt) * rr);
+                float4 sq = subject.sample(s, q);
+                float w = exp(-fs * 2.2);
+                acc += sq.rgb * sq.a * w;
+                wsum += sq.a * w;
+            }
+            float streaks = 0.5 + 0.5 * sin(th * 7.0 + log(r) * 18.0 + cp.time * 6.0);   // drifting inward
+            float near = smoothstep(h.rd * 3.0, h.rd * 0.8, r) * smoothstep(h.rs * 0.95, h.rs * 1.35, r);
+            float amt = saturate(wsum * 0.9) * cp.holePull * near * (0.35 + 0.65 * streaks) * (1.0 - sj.a);
+            float3 wcol = mix(acc / max(wsum, 1e-3), float3(1.0, 0.72, 0.42), 0.4) * 1.3;
+            outc = mix(outc, wcol, saturate(amt));
+        }
+    }
+    return float4(outc, 1.0);
+}
+
+// Downsample, keeping only what's brighter than `threshold` (0 = keep everything).
+fragment float4 camBrightFS(VOut in [[stage_in]],
+                            texture2d<float> src [[texture(0)]],
+                            constant float2& texel [[buffer(0)]],
+                            constant float& threshold [[buffer(1)]],
+                            sampler s [[sampler(0)]])
+{
+    float3 c = (src.sample(s, in.uv + texel * float2(-1.0, -1.0)).rgb + src.sample(s, in.uv + texel * float2(1.0, -1.0)).rgb +
+                src.sample(s, in.uv + texel * float2(-1.0, 1.0)).rgb + src.sample(s, in.uv + texel * float2(1.0, 1.0)).rgb) * 0.25;
+    float k = threshold > 0.0 ? smoothstep(threshold, threshold + 0.35, luma(c)) : 1.0;
+    return float4(c * k, 1.0);
+}
+
+// The finished picture: glow, the column-by-column wipe to the plain camera and back,
+// the dip when the look changes, and a vignette.
+fragment float4 camFinalFS(VOut in [[stage_in]],
+                           texture2d<float> comp [[texture(0)]],
+                           texture2d<float> glowNear [[texture(1)]],
+                           texture2d<float> glowFar [[texture(2)]],
+                           texture2d<float> cam [[texture(3)]],
+                           constant Uniforms& u [[buffer(0)]],
+                           constant CamParams& cp [[buffer(1)]],
+                           sampler s [[sampler(0)]])
+{
+    float3 c = comp.sample(s, in.uv).rgb;
+    float3 g = (glowNear.sample(s, in.uv).rgb * 0.8 + glowFar.sample(s, in.uv).rgb * 0.6) * cp.glow;
+    float3 look = saturate(c + g * (1.0 - 0.5 * c));
+    float2 q = in.uv - 0.5;
+    look *= mix(1.0 - cp.vignette, 1.0, smoothstep(0.85, 0.2, length(q * float2(1.15, 1.0))));
+
+    float2 px = in.uv * float2(u.resX, u.resY);
+    float2 cs = float2(u.cellH * u.cellAspect, u.cellH);
+    float2 rv = reveal(floor(px / cs), u.resY / u.cellH, u);
+    float3 raw = cam.sample(s, texUV(dispUV(in.uv, u), u)).rgb * u.camFade;
+    float3 outc = mix(raw, look, rv.x);
+    outc = mix(outc, float3(u.hotR, u.hotG, u.hotB), rv.y * 0.85);
+    return float4(outc * cp.fade, 1.0);
 }
 
 // Studio preview: the output frame, letterboxed into the view, mirrored like a mirror.
