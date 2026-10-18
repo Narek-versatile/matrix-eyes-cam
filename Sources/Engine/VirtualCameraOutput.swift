@@ -101,7 +101,12 @@ final class VirtualCameraOutput {
                                                  sampleTiming: &timing, sampleBufferOut: &sample)
         guard let sample else { return }
         let status = CMSimpleQueueEnqueue(queue, element: Unmanaged.passRetained(sample).toOpaque())
-        if status != noErr { Unmanaged.passUnretained(sample).release() }
+        if status != noErr {
+            Unmanaged.passUnretained(sample).release()
+            if frame % 90 == 1 { FileHandle.standardError.write(Data("virtual camera: enqueue failed (\(status))\n".utf8)) }
+            return
+        }
+        if frame % 150 == 1 { FileHandle.standardError.write(Data("virtual camera: sent frame \(frame), queue \(CMSimpleQueueGetCount(queue))/\(CMSimpleQueueGetCapacity(queue))\n".utf8)) }
         setStatus(.streaming)
     }
 
@@ -140,8 +145,9 @@ final class VirtualCameraOutput {
         for dev in objects(of: CMIOObjectID(kCMIOObjectSystemObject), selector: CMIOObjectPropertySelector(kCMIOHardwarePropertyDevices)) {
             guard string(of: dev, selector: CMIOObjectPropertySelector(kCMIODevicePropertyDeviceUID)) == VirtualCameraID.deviceUID else { continue }
             let streams = objects(of: dev, selector: CMIOObjectPropertySelector(kCMIODevicePropertyStreams))
-            // Direction 1 = input to the device, i.e. the sink we write into.
-            if let sink = streams.first(where: { uint32(of: $0, selector: CMIOObjectPropertySelector(kCMIOStreamPropertyDirection)) == 1 }) {
+            // CoreMediaIO reports the stream video apps read as direction 1 and the sink we write
+            // into as direction 0 (seen from the Mac, not from the device).
+            if let sink = streams.first(where: { uint32(of: $0, selector: CMIOObjectPropertySelector(kCMIOStreamPropertyDirection)) == 0 }) {
                 return (dev, sink)
             }
         }
@@ -193,6 +199,9 @@ final class VirtualCameraOutput {
         let changed = status != s
         status = s
         lock.unlock()
-        if changed { onStatus?(s) }
+        if changed {
+            FileHandle.standardError.write(Data("virtual camera: \(s.text)\n".utf8))
+            onStatus?(s)
+        }
     }
 }

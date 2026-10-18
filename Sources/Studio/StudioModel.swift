@@ -73,6 +73,8 @@ final class StudioModel: ObservableObject {
             camera.start(device: device)
         }
         if let dir = env["MATRIX_CAM_SNAPSHOTS"] { runSnapshots(into: dir) }
+        // `open -a "Matrix Eyes Cam" --args --install-camera` does what the Install button does.
+        if CommandLine.arguments.contains("--install-camera") { installCamera() }
 
         output = VirtualCameraOutput(device: device)
         output?.onStatus = { [weak self] status in Task { @MainActor in self?.virtualCamera = status } }
