@@ -1,0 +1,59 @@
+# XcodeGen spec for the signed build: the studio app with the camera extension embedded.
+# Generate with `xcodegen generate` (scripts/build-signed.sh does this).
+name: MatrixEyesCam
+options:
+  deploymentTarget:
+    macOS: "14.0"
+configFiles:
+  Debug: Signing.xcconfig
+  Release: Signing.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_HARDENED_RUNTIME: YES
+    ARCHS: arm64
+targets:
+  MatrixEyesCam:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/Engine
+      - path: Sources/Shared
+      - path: Sources/Studio
+      - path: Sources/main.swift
+      - path: Resources/Shaders
+        buildPhase: resources
+      - path: Resources/AppIcon.icns
+        buildPhase: resources
+      - path: build/DepthAnythingV2SmallF16.mlmodelc
+        buildPhase: resources
+        type: folder
+    settings:
+      base:
+        PRODUCT_NAME: Matrix Eyes Cam
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.narek-versatile.matrix-eyes-cam
+        INFOPLIST_FILE: Signing/App-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Signing/App.entitlements
+        OTHER_SWIFT_FLAGS: "-D STUDIO"
+    dependencies:
+      - target: MatrixEyesCamExtension
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/Library/SystemExtensions
+  MatrixEyesCamExtension:
+    type: system-extension
+    platform: macOS
+    sources:
+      - path: Sources/Extension
+      - path: Sources/Shared
+    settings:
+      base:
+        PRODUCT_NAME: io.github.narek-versatile.matrix-eyes-cam.extension
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.narek-versatile.matrix-eyes-cam.extension
+        INFOPLIST_FILE: Signing/Extension-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Signing/Extension.entitlements
+        SKIP_INSTALL: YES

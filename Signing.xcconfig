@@ -1,0 +1,8 @@
+// Signing for the Xcode build (scripts/build-signed.sh). The camera extension only loads when
+// the app and extension are signed by a real Apple developer team.
+//
+// Put your team in Signing.local.xcconfig (not committed), e.g.
+//   DEVELOPMENT_TEAM = ABCDE12345
+DEVELOPMENT_TEAM =
+CODE_SIGN_STYLE = Automatic
+#include? "Signing.local.xcconfig"

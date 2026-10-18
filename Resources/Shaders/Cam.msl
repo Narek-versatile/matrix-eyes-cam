@@ -1,0 +1,587 @@
+// Matrix Eyes Cam: background scenes, what your silhouette becomes, and the final composite.
+// Concatenated after Shaders.metal, Space.metal and Materials.metal (Uniforms, helpers, looks).
+
+// Must match `CamParams` in Engine.swift field for field (all 32-bit floats).
+struct CamParams {
+    float time;
+    float bgKind;        // 0 room, 1 blurred room, 2 tidy room, 3 space, 4 matrix rain, 5 aurora,
+                         // 6 synthwave, 7 infinite corridor, 8 escher stairs, 9 fractal cathedral
+    float bgSpeed;
+    float bgBlackHole;
+    float bgDim;         // tidy room: how far the room is calmed down
+    float subjMode;      // 0 real you, 1 effect, 2 material, 3 fill, 4 matrix code
+    float effect;        // 1 edge glow, 2 hologram, 3 neon outline, 4 pixelate, 5 ghost trails
+    float grade;         // 0 natural, 1 noir, 2 warm film, 3 cyberpunk
+    float material;      // 1 chrome, 2 quartz, 3 copper, 4 bronze, 5 doodle, 6 3D print
+    float fill;          // 0 your image/video, 1 galaxy, 2 fire, 3 ocean, 4 lava
+    float accentR, accentG, accentB;
+    float strength;      // effect strength 0..1
+    float keepFeatures;  // how much of your shading shows through fills
+    float lightWrap;
+    float maskOn;        // a person mask is available
+    float hasMedia;
+    float mediaAspect;
+    float trailDecay;
+};
+
+static float3 accentOf(constant CamParams& cp) { return float3(cp.accentR, cp.accentG, cp.accentB); }
+static float luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+static float3 displayTone(float3 hdr) { return pow(aces(hdr), float3(1.0 / 2.2)); }
+
+static float3 hueShift(float3 c, float a) {
+    const float3 k = float3(0.57735);
+    float ca = cos(a);
+    return c * ca + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - ca);
+}
+
+// ===========================================================================
+// Camera-based backgrounds: the room with you removed, blurred.
+
+// Premultiplied room-without-you at reduced size: blurring this and dividing by alpha gives a
+// blurred room with no halo of your colours around you.
+fragment float4 camRoomDownFS(VOut in [[stage_in]],
+                              texture2d<float> cam [[texture(0)]],
+                              texture2d<float> mask [[texture(1)]],
+                              constant Uniforms& u [[buffer(0)]],
+                              constant CamParams& cp [[buffer(1)]],
+                              sampler s [[sampler(0)]])
+{
+    float2 ct = texUV(dispUV(in.uv, u), u);
+    float m = cp.maskOn > 0.5 ? smoothstep(0.15, 0.5, mask.sample(s, ct).r) : 0.0;
+    float w = 1.0 - m;
+    return float4(cam.sample(s, ct).rgb * w, w);
+}
+
+// ===========================================================================
+// Generated scenes.
+
+static float3 auroraScene(float2 uv, float t, float aspect) {
+    float2 p = float2((uv.x - 0.5) * aspect, 1.0 - uv.y);          // y up, 0 = bottom
+    float3 col = mix(float3(0.003, 0.006, 0.02), float3(0.006, 0.014, 0.04), saturate(p.y * 1.2));
+    float3 dir = normalize(float3(p.x, p.y * 0.9 - 0.1, 1.0));
+    col += starfield(dir, t, 2.0 / 720.0) * smoothstep(0.3, 0.75, p.y) * 0.7;
+
+    float3 glow = float3(0.0);
+    for (int i = 0; i < 4; i++) {
+        float fi = float(i);
+        float x = p.x * (1.0 + 0.25 * fi) + t * 0.025 * (1.0 + fi * 0.4) + fi * 3.1;
+        float base = 0.5 + 0.07 * fi + 0.07 * sin(x * 1.9 + fi * 1.7 + t * 0.15) + 0.06 * (fbm2(float2(x * 1.4, t * 0.04 + fi)) - 0.5);
+        float h = p.y - base;
+        float curtain = smoothstep(-0.015, 0.02, h) * exp(-max(h, 0.0) * (4.0 + fi * 1.6));
+        float rays = 0.45 + 0.55 * fbm2(float2(x * 22.0, t * 0.35 + fi * 3.0));
+        float3 c = mix(float3(0.15, 1.0, 0.55), float3(0.55, 0.25, 1.0), saturate(h * 3.5 + fi * 0.12));
+        glow += c * curtain * rays * (0.6 - 0.1 * fi);
+    }
+    col += glow;
+
+    // mountains, and the aurora reflected faintly in a lake below them
+    float ridge = 0.3 + 0.09 * fbm2(float2(p.x * 1.6, 3.0)) + 0.05 * fbm2(float2(p.x * 6.0, 7.0));
+    float ridge2 = 0.24 + 0.07 * fbm2(float2(p.x * 2.6 + 9.0, 1.0));
+    float lake = 0.16;
+    if (p.y < ridge) col = col * 0.04 + float3(0.012, 0.016, 0.026) + glow * 0.05;
+    if (p.y < ridge2) col = float3(0.006, 0.008, 0.012) + glow * 0.02;
+    if (p.y < lake) {
+        col = float3(0.004, 0.006, 0.01);
+        float shimmer = 0.6 + 0.4 * fbm2(float2(p.x * 14.0, p.y * 90.0 + t * 0.4));
+        // the aurora's glow, reflected softly in the water
+        col += float3(0.08, 0.55, 0.32) * 0.07 * shimmer * smoothstep(0.02, lake, p.y);
+    }
+    return col;
+}
+
+static float3 synthwaveScene(float2 uv, float t, float aspect, float2 gridCoord, float2 gridFw) {
+    float2 p = float2((uv.x - 0.5) * aspect, 0.5 - uv.y);           // y up, horizon near 0
+    const float horizon = -0.04;
+    float3 col;
+    if (p.y > horizon) {
+        float h = p.y - horizon;
+        col = mix(float3(1.0, 0.33, 0.42), float3(0.25, 0.04, 0.35), saturate(h * 2.4));
+        col = mix(col, float3(0.02, 0.0, 0.07), saturate(h * 2.2 - 0.55));
+        col += starfield(normalize(float3(p.x, p.y, 1.0)), t, 2.0 / 720.0) * smoothstep(0.25, 0.45, h) * 0.6;
+        // sun with the classic slatted bottom
+        float2 sc = float2(0.0, horizon + 0.15);
+        float d = length(p - sc);
+        float3 sunCol = mix(float3(1.0, 0.18, 0.55), float3(1.0, 0.86, 0.25), saturate((p.y - sc.y + 0.2) / 0.4));
+        float below = sc.y - p.y;
+        float gap = below > -0.02 ? step(fract(p.y * 34.0 - t * 0.6), 0.12 + saturate(below + 0.02) * 2.2) : 0.0;
+        float sun = smoothstep(0.206, 0.2, d) * (1.0 - gap);
+        col += sunCol * 0.22 * exp(-max(d - 0.2, 0.0) * 9.0);
+        col = mix(col, sunCol * 1.25, sun);
+        // mountains in front of the sun
+        float ridge = horizon + 0.05 + 0.07 * abs(sin(p.x * 3.1 + 1.0)) * fbm2(float2(p.x * 3.0, 2.0)) + 0.025 * fbm2(float2(p.x * 12.0, 5.0));
+        if (p.y < ridge) {
+            col = float3(0.05, 0.0, 0.1);
+            col += float3(1.0, 0.2, 0.9) * smoothstep(0.004, 0.0, ridge - p.y) * 0.9;     // neon rim
+        }
+    } else {
+        // the grid floor, rolling toward you
+        float2 gl = abs(fract(gridCoord - 0.5) - 0.5) / max(gridFw, float2(1e-4));
+        float line = 1.0 - min(min(gl.x, gl.y), 1.0);
+        float dist = (horizon - p.y);
+        float fade = smoothstep(0.0, 0.25, dist);
+        col = float3(0.03, 0.0, 0.07) + float3(0.25, 0.0, 0.35) * smoothstep(0.12, 0.0, dist) * 0.6;
+        col += mix(float3(1.0, 0.2, 0.85), float3(0.2, 0.8, 1.0), fade) * line * (0.35 + 0.9 * fade);
+    }
+    return col;
+}
+
+// ---- impossible spaces, ray marched -------------------------------------
+
+static float2x2 rot2(float a) { float c = cos(a), s = sin(a); return float2x2(c, -s, s, c); }
+static float sdBox3(float3 p, float3 b) { float3 q = abs(p) - b; return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0); }
+
+// Infinite corridor: arched hall repeated every few metres, side halls every 10 m, and the whole
+// lattice twisting slowly around the axis you fly along. The twist is what makes it impossible.
+static float corridorMap(float3 p, thread float& mat) {
+    p.xy = rot2(p.z * 0.045) * p.xy;
+    float3 q = p;
+    q.x = fmod(q.x + 505.0, 10.0) - 5.0;                        // parallel halls, one centred on you
+    float cellZ = 3.0;
+    float3 c = q;
+    c.z = fmod(c.z + 1000.0 * cellZ, cellZ) - cellZ * 0.5;
+    // hall interior: walls, floor, barrel vault
+    float walls = 1.6 - abs(q.x);
+    float floorD = q.y + 1.2;
+    float vault = 1.9 - length(float2(q.x, max(q.y - 0.3, 0.0)));
+    float hall = min(min(walls, floorD), vault);
+    // side openings: every other cell, a doorway through to the next hall
+    float door = sdBox3(float3(abs(q.x) - 1.6, q.y + 0.1, c.z), float3(0.4, 1.1, 0.55));
+    hall = max(hall, -door);
+    // arch ribs and pillars
+    float rib = max(abs(c.z) - 0.12, vault - 0.22);          // a ring hugging the vault and walls
+    rib = max(rib, -(q.y + 1.2));
+    float pillar = sdBox3(float3(abs(q.x) - 1.48, q.y + 0.35, c.z), float3(0.12, 0.85, 0.12));
+    // a lamp hanging in the middle of every bay
+    float lamp = length(float3(q.x, q.y - 1.25, c.z)) - 0.11;
+    float d = hall;
+    mat = floorD <= min(walls, vault) + 1e-4 ? 2.0 : 0.0;     // floor tiles vs. plaster
+    if (rib < d) { d = rib; mat = 1.0; }
+    if (pillar < d) { d = pillar; mat = 1.0; }
+    if (lamp < d) { d = lamp; mat = 3.0; }
+    return d;
+}
+
+// Escher stairs: staircases in a 3D lattice, each cell's flight turned to a different "up".
+static float stairsCell(float3 p) {
+    // a flight of steps rising along +x, steps 0.32 high/deep, 1.2 wide (z)
+    const float s = 0.32;
+    float stepTop = s * floor(p.x / s + 1.0);
+    float slab = max(p.y - stepTop, (stepTop - 0.9) - p.y);
+    slab = max(slab, abs(p.z) - 0.6);
+    slab = max(slab, abs(p.x) - 1.6);
+    float land1 = sdBox3(p - float3(2.15, 1.6 - 0.15, 0.0), float3(0.6, 0.15, 0.6));
+    float land2 = sdBox3(p - float3(-2.15, -1.6 + 0.12, 0.0), float3(0.6, 0.15, 0.6));
+    float col1 = sdBox3(p - float3(2.6, 0.0, 0.55), float3(0.08, 1.6, 0.08));
+    return min(min(slab, min(land1, land2)), col1);
+}
+
+static float stairsMap(float3 p) {
+    const float cell = 7.5;
+    float3 id = floor(p / cell);
+    float3 q = fmod(p + cell * 1000.0, cell) - cell * 0.5;
+    float h = hash13(id + 4.0);
+    // three orientations, so in one cell "up" is y, in another x, in another z
+    if (h < 0.33) q = q.yxz * float3(1, -1, 1);
+    else if (h < 0.66) q = q.xzy * float3(1, 1, -1);
+    if (hash13(id + 9.0) > 0.5) q.x = -q.x;
+    return stairsCell(q) * 0.7;
+}
+
+// Fractal cathedral: an infinite Menger sponge, the same at every scale. You fly along one of
+// its main tunnels; the walls open onto smaller and smaller tunnels.
+static float spongeMap(float3 p) {
+    float3 q = fmod(p + 1001.0, 2.0) - 1.0;                    // period 2, a cell centred on the axis
+    float d = sdBox3(q, float3(1.0));
+    float sc = 1.0;
+    for (int i = 0; i < 4; i++) {
+        float3 a = fmod(q * sc + 1000.0, 2.0) - 1.0;           // (even offset keeps the folding in phase)
+        sc *= 3.0;
+        float3 r = abs(1.0 - 3.0 * abs(a));
+        float da = max(r.x, r.y), db = max(r.y, r.z), dc = max(r.z, r.x);
+        d = max(d, (min(da, min(db, dc)) - 1.0) / sc);
+    }
+    return d;
+}
+
+static float impossibleMap(float3 p, int kind, thread float& mat) {
+    mat = 0.0;
+    if (kind == 7) return corridorMap(p, mat);
+    if (kind == 8) return stairsMap(p);
+    return spongeMap(p);
+}
+
+static float3 impossibleNormal(float3 p, int kind) {
+    const float2 e = float2(0.0015, -0.0015);
+    float m;
+    return normalize(e.xyy * impossibleMap(p + e.xyy, kind, m) + e.yyx * impossibleMap(p + e.yyx, kind, m) +
+                     e.yxy * impossibleMap(p + e.yxy, kind, m) + e.xxx * impossibleMap(p + e.xxx, kind, m));
+}
+
+static float3 impossibleScene(float2 uv, float t, float aspect, int kind) {
+    float2 sp = float2((uv.x - 0.5) * aspect, 0.5 - uv.y);
+    float3 ro, rd;
+    if (kind == 7) {                        // fly down the hall
+        ro = float3(0.0, -0.15, t * 1.1);
+        rd = normalize(float3(sp, 1.15));
+    } else if (kind == 8) {                 // drift through the lattice, slowly turning
+        ro = float3(t * 0.22, t * 0.14, t * 0.32) + float3(3.75, 2.0, 3.75);
+        rd = normalize(float3(sp, 1.0));
+        rd.xz = rot2(t * 0.05) * rd.xz;
+        rd.yz = rot2(0.35 + 0.15 * sin(t * 0.07)) * rd.yz;
+    } else {                                // glide along a sponge tunnel
+        ro = float3(0.0, 0.0, t * 0.6);
+        rd = normalize(float3(sp, 1.1));
+        rd.xy = rot2(t * 0.03) * rd.xy;
+    }
+
+    float dist = 0.0, mat = 0.0;
+    int steps = 0;
+    bool hit = false;
+    for (int i = 0; i < 110; i++) {
+        float d = impossibleMap(ro + rd * dist, kind, mat);
+        if (d < 0.0015 * (1.0 + dist)) { hit = true; steps = i; break; }
+        dist += d;
+        if (dist > 45.0) break;
+        steps = i;
+    }
+
+    float3 fogCol = kind == 7 ? float3(0.55, 0.5, 0.45) : (kind == 8 ? float3(0.82, 0.78, 0.7) : float3(0.95, 0.6, 0.32));
+    if (!hit) return fogCol * (kind == 9 ? 1.1 : 0.9);
+
+    float3 p = ro + rd * dist;
+    float3 n = impossibleNormal(p, kind);
+    float ao = 1.0 - float(steps) / 110.0;
+    float3 L = normalize(float3(-0.4, 0.8, -0.35));
+    float diff = saturate(dot(n, L)) * 0.7 + 0.3;
+    float3 albedo;
+    if (kind == 7) {
+        // work in the hall's own (twisted, repeated) frame
+        float3 q = p;
+        q.xy = rot2(p.z * 0.045) * q.xy;
+        float3 qn = n;
+        qn.xy = rot2(p.z * 0.045) * qn.xy;
+        q.x = fmod(q.x + 505.0, 10.0) - 5.0;
+        float bayZ = fmod(q.z + 3000.0, 3.0) - 1.5;
+        if (mat > 2.5) return float3(1.0, 0.8, 0.5) * 1.1;       // the lamps themselves
+        if (mat > 1.5) {
+            float checker = fmod(floor(q.x * 1.25 + 100.0) + floor(q.z * 1.25 + 100.0), 2.0);
+            albedo = checker < 1.0 ? float3(0.82, 0.8, 0.76) : float3(0.06, 0.055, 0.05);
+        } else {
+            albedo = mat > 0.5 ? float3(0.36, 0.3, 0.25) : float3(0.66, 0.58, 0.48);
+        }
+        // light from this bay's lamp, falling off with distance
+        float3 toLamp = float3(-q.x, 1.25 - q.y, -bayZ);
+        float dl = length(toLamp);
+        float lampLight = saturate(dot(qn, toLamp / dl)) * 2.4 / (1.0 + dl * dl * 0.7);
+        diff = 0.12 + lampLight;
+        float3 fogLamp = float3(0.32, 0.25, 0.18);
+        float3 col = albedo * diff * float3(1.0, 0.85, 0.65) * mix(0.45, 1.0, ao);
+        // a glossy sheen on the marble floor
+        if (mat > 1.5) col += float3(1.0, 0.85, 0.6) * pow(saturate(dot(reflect(rd, qn), normalize(toLamp))), 30.0) * 0.5 / (1.0 + dl);
+        float fog = 1.0 - exp(-dist * 0.075);
+        return mix(col, fogLamp, fog);
+    } else if (kind == 8) {
+        // lithograph shading: tops light, sides mid, fronts dark, whatever the cell's "up" is
+        float3 an = abs(n);
+        float tone = an.y > max(an.x, an.z) ? 0.95 : (an.x > an.z ? 0.66 : 0.42);
+        albedo = float3(0.9, 0.85, 0.76) * tone;
+        diff = 0.75 + 0.25 * saturate(dot(n, L));
+        float3 fogStairs = mix(float3(0.22, 0.2, 0.17), float3(0.92, 0.88, 0.8), saturate(rd.y * 0.6 + 0.55));
+        float3 col = albedo * diff * mix(0.55, 1.0, ao);
+        float fog = 1.0 - exp(-dist * 0.06);
+        return mix(col, fogStairs, fog);
+    } else {
+        albedo = float3(0.9, 0.78, 0.6);
+        // light pouring in from far away, edges glowing gold
+        diff = diff * 0.7 + pow(saturate(dot(n, -rd)), 3.0) * 0.2;
+    }
+    float3 col = albedo * diff * mix(0.35, 1.0, ao * ao);
+    float fog = 1.0 - exp(-dist * (kind == 7 ? 0.085 : (kind == 8 ? 0.07 : 0.11)));
+    return mix(col, fogCol, fog);
+}
+
+// ===========================================================================
+// The background pass.
+
+fragment float4 camBackgroundFS(VOut in [[stage_in]],
+                                texture2d<float> cam [[texture(0)]],
+                                texture2d<float> roomBlur [[texture(1)]],
+                                texture2d<float> lum [[texture(2)]],
+                                texture2d<float> atlas [[texture(3)]],
+                                texture2d<float> geo [[texture(4)]],
+                                constant Uniforms& u [[buffer(0)]],
+                                constant CamParams& cp [[buffer(1)]],
+                                sampler s [[sampler(0)]],
+                                sampler glyphSampler [[sampler(1)]])
+{
+    int kind = int(cp.bgKind + 0.5);
+    float t = cp.time * cp.bgSpeed;
+    float aspect = u.resX / u.resY;
+    float2 ct = texUV(dispUV(in.uv, u), u);
+
+    // floor-grid coordinates for synthwave, computed here (uniform control flow) for antialiasing
+    float2 sp = float2((in.uv.x - 0.5) * aspect, 0.5 - in.uv.y);
+    float depth = 0.11 / max(-0.04 - sp.y, 0.002);
+    float2 grid = float2(sp.x * depth * 2.6, depth * 1.2 + t * 1.6);
+    float2 gridFw = fwidth(grid);
+
+    float3 col;
+    if (kind == 0) {
+        col = cam.sample(s, ct).rgb;
+    } else if (kind == 1 || kind == 2) {
+        float4 b = roomBlur.sample(s, in.uv);
+        col = b.a > 0.02 ? b.rgb / b.a : cam.sample(s, ct).rgb;
+        if (kind == 2) {
+            // tidy: calm the room down into a soft, low-contrast studio backdrop
+            float l = luma(col);
+            col = mix(col, float3(l), 0.65 * cp.bgDim);
+            col = mix(col, col * float3(0.92, 0.96, 1.05), 0.6);
+            col = mix(col, float3(0.18, 0.19, 0.21), 0.35 * cp.bgDim);
+            col *= 1.0 - 0.45 * cp.bgDim;
+            float2 q = in.uv - 0.5;
+            col *= mix(0.7, 1.0, smoothstep(0.85, 0.25, length(q * float2(1.1, 1.0))));
+        }
+    } else if (kind == 3) {
+        col = displayTone(spaceAt(in.uv, float2(0.0), u));
+    } else if (kind == 4) {
+        float m;
+        col = 1.0 - exp(-matrixCodeColor(in.uv, 0.0, 0.0, u, lum, atlas, geo, s, glyphSampler, m) * 6.0);
+    } else if (kind == 5) {
+        col = displayTone(auroraScene(in.uv, t, aspect) * 1.6);
+    } else if (kind == 6) {
+        col = displayTone(synthwaveScene(in.uv, t, aspect, grid, gridFw) * 1.3);
+    } else {
+        col = impossibleScene(in.uv, t, aspect, kind);
+        col = pow(col, float3(1.1));
+    }
+    return float4(col, 1.0);
+}
+
+// ===========================================================================
+// What your silhouette becomes.
+
+static float3 gradeColor(float3 c, float g) {
+    if (g < 0.5) return c;
+    float l = luma(c);
+    if (g < 1.5) {                                      // noir
+        float k = smoothstep(0.04, 0.92, l);
+        return float3(k) * float3(1.0, 0.985, 0.95);
+    }
+    if (g < 2.5) {                                      // warm film
+        c = c * float3(1.08, 1.0, 0.86);
+        return c * 0.9 + float3(0.05, 0.035, 0.02);
+    }
+    // cyberpunk: teal shadows, magenta highlights
+    float3 split = mix(float3(0.0, 0.55, 0.7), float3(1.0, 0.3, 0.85), smoothstep(0.15, 0.85, l));
+    return saturate(mix(c, split * (0.35 + l), 0.45) * 1.08);
+}
+
+// Average of the mask over a ring of `radiusPx` around this point: 0.5 on the silhouette edge.
+static float ringMask(texture2d<float> mask, float2 uv, float radiusPx, constant Uniforms& u, sampler s) {
+    float sum = 0.0;
+    for (int i = 0; i < 12; i++) {
+        float a = float(i) * (6.2831853 / 12.0);
+        float2 o = float2(cos(a), sin(a)) * radiusPx / float2(u.resX, u.resY);
+        sum += mask.sample(s, texUV(dispUV(uv + o, u), u)).r;
+    }
+    return sum / 12.0;
+}
+
+static float3 galaxyFill(float2 uv, float t, float aspect) {
+    float2 p = float2((uv.x - 0.5) * aspect, uv.y - 0.5);
+    float r = length(p), a = atan2(p.y, p.x);
+    float arms = 0.5 + 0.5 * sin(a * 2.0 - log(r + 0.02) * 5.0 + t * 0.25);
+    float neb = fbm2(float2(a * 1.5 + t * 0.03, r * 6.0 - t * 0.1)) * arms;
+    float3 col = mix(float3(0.25, 0.1, 0.55), float3(1.0, 0.45, 0.75), neb) * neb * 1.4;
+    col += float3(1.0, 0.9, 0.75) * exp(-r * 9.0) * 1.2;
+    col += starfield(normalize(float3(p * 1.5, 1.0)), t, 2.0 / 720.0) * 1.3;
+    return col + float3(0.02, 0.01, 0.05);
+}
+
+static float3 fireFill(float2 uv, float t, float aspect) {
+    float2 p = float2((uv.x - 0.5) * aspect, 1.0 - uv.y);
+    float n = fbm2(float2(p.x * 3.0, p.y * 2.2 - t * 1.4)) * 0.7 + fbm2(float2(p.x * 7.0, p.y * 5.0 - t * 2.6)) * 0.3;
+    float heat = saturate(n * 1.5 - p.y * 0.55 + 0.2);
+    float3 col = mix(float3(0.05, 0.0, 0.0), float3(0.9, 0.12, 0.02), smoothstep(0.1, 0.45, heat));
+    col = mix(col, float3(1.0, 0.6, 0.1), smoothstep(0.4, 0.75, heat));
+    col = mix(col, float3(1.0, 0.95, 0.7), smoothstep(0.75, 1.0, heat));
+    return col;
+}
+
+static float3 oceanFill(float2 uv, float t, float aspect) {
+    float2 p = float2(uv.x * aspect, uv.y) * 6.0;
+    // classic iterative caustics
+    float2 i = p;
+    float c = 1.0, inten = 0.005;
+    for (int n = 0; n < 5; n++) {
+        float tt = t * 0.35 * (1.0 - (3.5 / float(n + 1)));
+        i = p + float2(cos(tt - i.x) + sin(tt + i.y), sin(tt - i.y) + cos(tt + i.x));
+        c += 1.0 / length(float2(p.x / (sin(i.x + tt) / inten), p.y / (cos(i.y + tt) / inten)));
+    }
+    c /= 5.0;
+    c = 1.17 - pow(c, 1.4);
+    float caust = pow(abs(c), 8.0);
+    float3 deep = mix(float3(0.0, 0.06, 0.16), float3(0.0, 0.22, 0.32), uv.y);
+    return deep + float3(0.5, 0.9, 1.0) * saturate(caust) * 0.7;
+}
+
+static float3 lavaFill(float2 uv, float t, float aspect) {
+    float2 p = float2(uv.x * aspect, uv.y) * 5.0 + float2(0.0, t * 0.05);
+    float2 cell = floor(p), f = fract(p);
+    float d1 = 8.0, d2 = 8.0;
+    for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+        float2 g = float2(i, j);
+        float2 o = 0.5 + 0.4 * sin(t * 0.25 + 6.2831 * hash22(cell + g));
+        float d = length(g + o - f);
+        if (d < d1) { d2 = d1; d1 = d; } else if (d < d2) d2 = d;
+    }
+    float crack = smoothstep(0.12, 0.0, d2 - d1);
+    float pulse = 0.7 + 0.3 * sin(t * 1.3 + fbm2(p * 0.8) * 6.0);
+    float3 rock = float3(0.06, 0.035, 0.03) * (0.7 + 0.6 * fbm2(p * 3.0));
+    return rock + float3(1.0, 0.35, 0.05) * crack * pulse * 2.0 + float3(1.0, 0.8, 0.3) * crack * crack * pulse;
+}
+
+static float2 coverUV(float2 uv, float srcAspect, float dstAspect) {
+    float2 c = uv - 0.5;
+    if (srcAspect > dstAspect) c.x *= dstAspect / srcAspect; else c.y *= srcAspect / dstAspect;
+    return c + 0.5;
+}
+
+fragment float4 camSubjectFS(VOut in [[stage_in]],
+                             texture2d<float> cam [[texture(0)]],
+                             texture2d<float> mask [[texture(1)]],
+                             texture2d<float> lum [[texture(2)]],
+                             texture2d<float> atlas [[texture(3)]],
+                             texture2d<float> geo [[texture(4)]],
+                             texture2d<float> media [[texture(5)]],
+                             constant Uniforms& u [[buffer(0)]],
+                             constant CamParams& cp [[buffer(1)]],
+                             sampler s [[sampler(0)]],
+                             sampler glyphSampler [[sampler(1)]])
+{
+    float2 uv = in.uv;
+    float2 res = float2(u.resX, u.resY);
+    float2 px = uv * res;
+    float aspect = u.resX / u.resY;
+    float2 ct = texUV(dispUV(uv, u), u);
+    float m = cp.maskOn > 0.5 ? mask.sample(s, ct).r : 1.0;
+    float a = cp.maskOn > 0.5 ? smoothstep(0.3, 0.7, m) : 1.0;
+    float3 camc = cam.sample(s, ct).rgb;
+    float3 accent = accentOf(cp);
+    int mode = int(cp.subjMode + 0.5);
+    float3 col = gradeColor(camc, cp.grade);
+
+    if (mode == 1) {
+        int fx = int(cp.effect + 0.5);
+        float k = cp.strength;
+        if (fx == 1) {                                       // edge glow
+            float ring = ringMask(mask, uv, 14.0, u, s);
+            float edge = saturate(1.0 - abs(ring - 0.5) * 2.0);
+            float outer = saturate(ringMask(mask, uv, 34.0, u, s) * 1.6) * (1.0 - a);
+            col = mix(col, accent, edge * a * 0.55 * k);
+            float g = max(edge, outer * 0.7) * k * (1.0 - a);
+            float aOut = a + g * (1.0 - a);
+            col = (col * a + accent * 1.3 * g * (1.0 - a)) / max(aOut, 1e-3);
+            a = aOut;
+        } else if (fx == 2) {                                // hologram
+            float band = floor(px.y / 22.0);
+            float glitch = step(0.94, hash12(float2(band, floor(cp.time * 9.0))));
+            float2 gct = texUV(dispUV(uv + float2((hash12(float2(band, floor(cp.time * 9.0)) + 3.0) - 0.5) * 0.06 * glitch, 0.0), u), u);
+            float l = luma(cam.sample(s, gct).rgb);
+            float scan = 0.7 + 0.3 * sin(px.y * 1.6 - cp.time * 12.0);
+            float flicker = 0.88 + 0.12 * hash12(float2(floor(cp.time * 24.0), 1.0));
+            float ring = ringMask(mask, uv, 8.0, u, s);
+            float edge = saturate(1.0 - abs(ring - 0.5) * 2.0);
+            col = accent * (0.18 + 1.25 * l) * scan * flicker + accent * edge * 0.9;
+            a = a * mix(1.0, 0.72, k) * flicker + edge * 0.3 * (1.0 - a);
+            a = saturate(a);
+        } else if (fx == 3) {                                // neon outline
+            float hue = cp.time * 0.4;
+            float3 neon = hueShift(accent, hue * k);
+            float thin = saturate(1.0 - abs(ringMask(mask, uv, 4.0, u, s) - 0.5) * 3.0);
+            float wide = saturate(1.0 - abs(ringMask(mask, uv, 18.0, u, s) - 0.5) * 2.0);
+            float3 body = neon * 0.04 + col * 0.12 * (1.0 - k);
+            float line = smoothstep(0.35, 0.9, thin);
+            col = mix(body, neon * 1.6, line) + neon * wide * 0.5;
+            a = max(a * mix(1.0, 0.92, k), max(line, wide * 0.6));
+        } else if (fx == 4) {                                // pixelate
+            float block = mix(10.0, 34.0, k) * max(u.resY / 720.0, 1.0);
+            float2 buv = (floor(px / block) + 0.5) * block / res;
+            float2 bct = texUV(dispUV(buv, u), u);
+            col = gradeColor(cam.sample(s, bct).rgb, cp.grade);
+            a = cp.maskOn > 0.5 ? step(0.5, mask.sample(s, bct).r) : 1.0;
+        }
+        // 5 = ghost trails: the subject stays as is; the trail pass draws the echoes
+    } else if (mode == 2) {                                  // materials from Matrix Eyes
+        float3 mc = materialColor(uv, cp.material, u, lum, geo, s);
+        col = cp.material > 4.5 && cp.material < 5.5 ? saturate(mc) : displayTone(mc);
+    } else if (mode == 3) {                                  // fill
+        int f = int(cp.fill + 0.5);
+        float3 fc;
+        if (f == 0) fc = cp.hasMedia > 0.5 ? media.sample(s, coverUV(uv, cp.mediaAspect, aspect)).rgb : float3(0.5);
+        else if (f == 1) fc = galaxyFill(uv, cp.time, aspect);
+        else if (f == 2) fc = fireFill(uv, cp.time, aspect);
+        else if (f == 3) fc = oceanFill(uv, cp.time, aspect);
+        else fc = lavaFill(uv, cp.time, aspect);
+        // keep a bit of your own light and shade so a face still reads as a face
+        float l = luma(camc);
+        fc *= mix(1.0, 0.45 + 1.0 * l, cp.keepFeatures);
+        col = f == 1 ? displayTone(fc) : saturate(fc);     // galaxy is HDR; the others are display colours
+        float ring = ringMask(mask, uv, 6.0, u, s);
+        col += saturate(1.0 - abs(ring - 0.5) * 2.0) * 0.18;
+    } else if (mode == 4) {                                  // Matrix code
+        float cov;
+        float3 mc = matrixCodeColor(uv, 1.0, u.depthFade, u, lum, atlas, geo, s, glyphSampler, cov);
+        col = 1.0 - exp(-mc * 2.4);        // brighter than in Matrix Eyes: there's no glow pass here
+    }
+    return float4(col, a);
+}
+
+// Ghost trails: fading echoes of where you were.
+fragment float4 camTrailFS(VOut in [[stage_in]],
+                           texture2d<float> prev [[texture(0)]],
+                           texture2d<float> subject [[texture(1)]],
+                           constant CamParams& cp [[buffer(1)]],
+                           sampler s [[sampler(0)]])
+{
+    if (!(cp.subjMode > 0.5 && cp.subjMode < 1.5 && cp.effect > 4.5)) return float4(0.0);
+    float4 old = prev.sample(s, in.uv + float2(0.0, 0.0015)) * cp.trailDecay;
+    float4 cur = subject.sample(s, in.uv);
+    float3 tint = mix(cur.rgb, accentOf(cp) * (0.4 + luma(cur.rgb)), 0.6);
+    return max(old, float4(tint * cur.a, cur.a) * 0.9);
+}
+
+// ===========================================================================
+// Final picture: background, trails, then you, with background light wrapping onto your edges.
+
+fragment float4 camCompositeFS(VOut in [[stage_in]],
+                               texture2d<float> background [[texture(0)]],
+                               texture2d<float> subject [[texture(1)]],
+                               texture2d<float> trail [[texture(2)]],
+                               texture2d<float> bgSoft [[texture(3)]],
+                               constant CamParams& cp [[buffer(1)]],
+                               sampler s [[sampler(0)]])
+{
+    float3 bg = background.sample(s, in.uv).rgb;
+    float4 tr = trail.sample(s, in.uv);
+    bg = bg * (1.0 - tr.a * 0.8) + tr.rgb * 0.8;
+    float4 sj = subject.sample(s, in.uv);
+    float3 soft = bgSoft.sample(s, in.uv).rgb;
+    float wrap = cp.lightWrap * sj.a * (1.0 - smoothstep(0.55, 1.0, sj.a));
+    float3 subj = mix(sj.rgb, soft, wrap);
+    return float4(mix(bg, subj, sj.a), 1.0);
+}
+
+// Studio preview: the output frame, letterboxed into the view, mirrored like a mirror.
+struct PreviewParams { float mirror; float scaleX; float scaleY; float pad; };
+
+fragment float4 camPreviewFS(VOut in [[stage_in]],
+                             texture2d<float> frame [[texture(0)]],
+                             constant PreviewParams& pp [[buffer(0)]],
+                             sampler s [[sampler(0)]])
+{
+    float2 uv = (in.uv - 0.5) / float2(pp.scaleX, pp.scaleY) + 0.5;
+    if (any(uv < 0.0) || any(uv > 1.0)) return float4(0.0, 0.0, 0.0, 1.0);
+    if (pp.mirror > 0.5) uv.x = 1.0 - uv.x;
+    return float4(frame.sample(s, uv).rgb, 1.0);
+}

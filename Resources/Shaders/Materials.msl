@@ -1,0 +1,344 @@
+// Material looks: the camera scene is turned into a 3D surface (depth map for shape, picture
+// brightness for fine relief) and shaded as chrome, quartz, copper, bronze, ink doodle or
+// printed plastic. Concatenated after Shaders.metal and Space.metal.
+//
+// View space: x right, y down, z away from the camera. Surfaces face the camera (n.z < 0).
+
+static float vnoise3(float3 p) {
+    float3 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = hash13(i),                      n100 = hash13(i + float3(1, 0, 0));
+    float n010 = hash13(i + float3(0, 1, 0)),    n110 = hash13(i + float3(1, 1, 0));
+    float n001 = hash13(i + float3(0, 0, 1)),    n101 = hash13(i + float3(1, 0, 1));
+    float n011 = hash13(i + float3(0, 1, 1)),    n111 = hash13(i + float3(1, 1, 1));
+    return mix(mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+               mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y), f.z);
+}
+
+static float fbm3(float3 p) {
+    float a = 0.5, s = 0.0;
+    for (int i = 0; i < 4; i++) { s += a * vnoise3(p); p = p * 2.02 + 11.7; a *= 0.5; }
+    return s;
+}
+
+struct Surf {
+    float3 P;        // position (metres, camera at the origin)
+    float3 n;        // shading normal: shape from depth plus fine relief from the picture
+    float3 I;        // direction from the camera to the surface
+    float z;
+    float L;         // shaped scene brightness
+    float ao;        // 1 = open, toward 0 = crease
+    float cav;       // > 0 sticking out, < 0 recessed
+    float lumEdge;   // strength of picture edges
+    float depthEdge; // depth silhouettes
+    float pitch;     // fwidth of the layer coordinate (for antialiasing)
+};
+
+static float3 keyLight(float t) {
+    return normalize(float3(-0.5 + 0.28 * sin(t * 0.33), -0.55 + 0.1 * cos(t * 0.27), -0.67));
+}
+
+// ---------------------------------------------------------------------------
+// Environments reflected by the metals.
+
+static float3 envChrome(float3 r, float t) {
+    float up = -r.y;
+    float3 col = mix(float3(0.003, 0.006, 0.016), float3(0.035, 0.06, 0.12), saturate(up * 0.5 + 0.5));
+    // studio strip lights: narrow bright bands are what make chrome read as chrome
+    float s1 = (up - 0.34) * 9.0, s2 = (up + 0.30) * 10.0, s3 = (up - 0.78) * 14.0;
+    col += float3(0.9, 0.95, 1.0) * exp(-s1 * s1) * 0.85;
+    col += float3(0.45, 0.62, 1.0) * exp(-s2 * s2) * 0.4;
+    col += float3(1.0, 1.0, 1.0) * exp(-s3 * s3) * 0.5;
+    float3 kd = keyLight(t);
+    float k = saturate(dot(r, kd));
+    col += float3(1.0, 0.97, 0.93) * (pow(k, 70.0) * 12.0 + pow(k, 9.0) * 0.3);
+    float rimL = saturate(dot(r, normalize(float3(0.85, -0.2, -0.2))));
+    col += float3(0.4, 0.65, 1.0) * pow(rimL, 22.0) * 5.0;
+    col += float3(0.45, 0.5, 0.62) * pow(saturate(dot(r, normalize(float3(0.0, 0.9, -0.45)))), 8.0) * 0.35;
+    col += float3(0.2, 0.35, 0.9) * pow(saturate(r.z), 4.0) * 0.4;
+    return col;
+}
+
+// Soft, warm studio for rough metals (copper, bronze).
+static float3 envWarm(float3 r, float t, float rough) {
+    float up = -r.y;
+    float3 col = mix(float3(0.05, 0.03, 0.02), float3(0.55, 0.45, 0.36), saturate(up * 0.5 + 0.5));
+    float k = saturate(dot(r, keyLight(t)));
+    float sharp = mix(60.0, 6.0, rough);
+    col += float3(1.0, 0.92, 0.8) * (pow(k, sharp) * mix(5.0, 0.9, rough) + pow(k, 3.0) * 0.25);
+    col += float3(0.7, 0.8, 1.0) * pow(saturate(dot(r, normalize(float3(0.8, -0.2, -0.3)))), mix(10.0, 3.0, rough)) * 0.9;
+    return col;
+}
+
+// ---------------------------------------------------------------------------
+// Materials. Each returns scene-linear colour (can exceed 1; the composite rolls it off).
+
+static float3 shadeChrome(Surf sf, constant Uniforms& u) {
+    float t = u.time;
+    float3 n = sf.n;
+    // a slow liquid shimmer on the surface
+    n.xy += (float2(vnoise3(sf.P * 6.0 + float3(0, 0, t * 0.25)), vnoise3(sf.P * 6.0 + 31.0 + float3(t * 0.2, 0, 0))) - 0.5) * 0.035;
+    n = normalize(n);
+    float3 r = reflect(sf.I, n);
+    float cosT = saturate(dot(n, -sf.I));
+    float3 F0 = float3(0.90, 0.93, 0.98);
+    float3 F = F0 + (1.0 - F0) * pow(1.0 - cosT, 5.0);
+    float3 col = envChrome(r, t) * F * (0.45 + 0.55 * sf.ao);
+    col += float3(0.2, 0.35, 0.8) * pow(1.0 - cosT, 3.0) * 0.18;    // cold rim
+    return col;
+}
+
+static float3 shadeQuartz(Surf sf, constant Uniforms& u) {
+    float t = u.time;
+    float3 n = sf.n;
+    // raking light from the upper left, like a statue in a gallery
+    float3 kd = normalize(float3(-0.78 + 0.2 * sin(t * 0.33), -0.5, -0.38));
+    float ndl = dot(n, kd);
+    float wrap = saturate((ndl + 0.12) / 1.12);
+
+    // veins and clouds inside the stone
+    float3 q = sf.P * 3.2;
+    float warp = fbm3(q * 0.7);
+    float w1 = fbm3(q + warp * 2.4);
+    float vein = pow(1.0 - abs(w1 * 2.0 - 1.0), 9.0);
+    float w2 = fbm3(q * 1.9 + 7.0 + warp * 1.5);
+    float vein2 = pow(1.0 - abs(w2 * 2.0 - 1.0), 14.0);
+    float cloud = fbm3(q * 0.6 + 3.0);
+    float3 base = float3(0.80, 0.815, 0.87) * (0.84 + 0.16 * cloud);
+    base = mix(base, float3(0.38, 0.45, 0.62), saturate(vein * 0.75 + vein2 * 0.5));
+
+    float3 amb = float3(0.28, 0.36, 0.58) * (0.10 + 0.16 * (0.5 - 0.5 * n.y)) * sf.ao;
+    float3 col = base * (float3(1.0, 0.96, 0.9) * wrap * wrap * 0.95 + amb);
+
+    // light passing through the stone: warm glow toward the edges and in thin parts
+    float cosT = saturate(dot(n, -sf.I));
+    float sss = pow(1.0 - cosT, 2.2) * (0.35 + 0.65 * saturate(ndl * 0.5 + 0.5));
+    col += float3(1.0, 0.74, 0.7) * sss * 0.38 * (0.4 + 0.6 * sf.ao);
+
+    // polished surface
+    float3 h = normalize(kd - sf.I);
+    float nh = saturate(dot(n, h));
+    col += float3(1.0, 0.98, 0.96) * (pow(nh, 110.0) * 1.5 + pow(nh, 14.0) * 0.1) * (0.5 + 0.5 * sf.ao);
+
+    // crystal glints: tiny facets that catch the moving light
+    float2 gp = sf.P.xy * 70.0 / max(sf.z, 0.3) * 0.55;
+    float2 cell = floor(gp);
+    float2 rv = hash22(cell) * 2.0 - 1.0;
+    float3 n2 = normalize(n + float3(rv * 0.55, 0.0));
+    float g = pow(saturate(dot(reflect(sf.I, n2), kd)), 260.0);
+    col += float3(1.0, 0.98, 1.0) * g * step(0.62, hash12(cell + 3.0)) * 5.0 * sf.ao;
+    return col;
+}
+
+static float3 shadeCopper(Surf sf, constant Uniforms& u) {
+    float t = u.time;
+    float3 n = sf.n;
+    float3 kd = keyLight(t);
+    float up = saturate(-n.y);
+
+    float pm = fbm3(sf.P * 6.5);
+    float pit = fbm3(sf.P * 26.0 + 5.0);
+    // verdigris grows in recesses, on upward faces and in blotches; polished copper shows on high points
+    float pat = pm * 0.95 + 0.4 * (1.0 - sf.ao) + 0.3 * up + 0.14 * pit - 0.08 - 0.3 * saturate(sf.cav);
+    float patina = smoothstep(0.3, 0.52, pat);
+
+    float3 r = reflect(sf.I, n);
+    float3 copperAlbedo = float3(0.74, 0.32, 0.15);
+    float3 metal = copperAlbedo * (0.05 + 0.95 * envWarm(r, t, 0.3)) * (0.35 + 0.65 * sf.ao);
+
+    float3 patAlbedo = mix(float3(0.09, 0.36, 0.29), float3(0.26, 0.58, 0.47), smoothstep(0.3, 0.8, pit * 0.6 + pm * 0.5));
+    float wrap = saturate((dot(n, kd) + 0.4) / 1.4);
+    float3 patLit = patAlbedo * (wrap * wrap * 0.9 + 0.16 * sf.ao);
+    float3 h = normalize(kd - sf.I);
+    patLit += float3(0.7, 0.95, 0.85) * pow(saturate(dot(n, h)), 20.0) * 0.1;
+
+    return mix(metal, patLit, patina);
+}
+
+static float3 shadeBronze(Surf sf, constant Uniforms& u) {
+    float t = u.time;
+    float3 n = sf.n;
+    float pit = fbm3(sf.P * 22.0 + 2.0);
+    float tone = fbm3(sf.P * 5.0);
+    // brushed micro-variation in how glossy the metal is
+    float rough = saturate(0.25 + 0.5 * pit);
+    float3 r = reflect(sf.I, n);
+    float3 albedo = float3(0.50, 0.30, 0.12) * (0.8 + 0.4 * tone);
+    float3 metal = albedo * (0.05 + 1.0 * envWarm(r, t, rough)) * (0.3 + 0.7 * sf.ao);
+    // polished highlights where the bronze is worn bright, dark patina in the crevices
+    float worn = smoothstep(-0.05, 0.45, sf.cav);
+    float3 h = normalize(keyLight(t) - sf.I);
+    metal += float3(1.0, 0.8, 0.45) * pow(saturate(dot(n, h)), mix(60.0, 18.0, rough)) * (0.5 + 0.9 * worn) * sf.ao;
+    float3 dark = mix(float3(0.035, 0.026, 0.016), float3(0.07, 0.11, 0.08), smoothstep(0.35, 0.75, pit)) * (0.6 + 0.8 * saturate(dot(n, keyLight(t)) + 0.3));
+    float darkAmt = saturate((1.0 - sf.ao) * 1.4 + (1.0 - worn) * 0.35 + (pit - 0.5) * 0.5);
+    return mix(metal, dark, saturate(darkAmt * 0.85));
+}
+
+static float3 shadePlastic(Surf sf, constant Uniforms& u) {
+    float t = u.time;
+    float3 n = sf.n;
+    // Layer lines: the printer lays the object down in thin horizontal slices.
+    const float layerH = 0.0021;
+    float ph = sf.P.y / layerH;
+    float ridge = sin(ph * 6.2831853);
+    float aa = 1.0 - smoothstep(0.35, 0.9, sf.pitch);            // fade out when the lines get finer than pixels
+    float slope = abs(n.y);
+    float3 nl = normalize(n + float3(0.0, ridge * (0.10 + 0.42 * slope) * aa, 0.0));
+    // slight under-extrusion banding
+    float band = 0.93 + 0.07 * sin(ph * 0.31 + vnoise3(float3(sf.P.xy * 2.0, 0.0)) * 6.0);
+    float seam = 1.0 - 0.18 * smoothstep(0.82, 1.0, fract(ph)) * aa;
+
+    float3 kd = keyLight(t);
+    float wrap = saturate((dot(nl, kd) + 0.2) / 1.2);
+    float3 filament = float3(0.80, 0.045, 0.035);
+    filament *= 0.94 + 0.06 * vnoise3(sf.P * 90.0);
+    float3 amb = float3(0.55, 0.6, 0.7) * (0.14 + 0.14 * (0.5 - 0.5 * n.y)) * sf.ao;
+    float3 col = filament * (float3(1.0, 0.97, 0.93) * wrap * wrap * 0.95 + amb) * band * seam;
+    // soft sheen
+    float3 h = normalize(kd - sf.I);
+    col += float3(1.0, 0.85, 0.8) * pow(saturate(dot(nl, h)), 26.0) * 0.3 * sf.ao;
+    return col;
+}
+
+// ---------------------------------------------------------------------------
+// Doodle: ballpoint on notebook paper. Contours from depth and picture edges, hatching from
+// the shading; everything wobbles a few times a second like a hand-drawn animation.
+
+static float hatchLine(float coord, float width) {
+    float d = abs(fract(coord) - 0.5) * 2.0;
+    return smoothstep(width + 0.12, width - 0.04, d);
+}
+
+static float3 shadeDoodle(float2 uv, Surf sf, float tone, texture2d<float> geo, texture2d<float> lum,
+                          constant Uniforms& u, sampler s, float2 ct)
+{
+    float unit = max(u.resY / 900.0, 1.0);
+    float2 px = uv * float2(u.resX, u.resY);
+    float frame = floor(u.time * 7.0);
+    float2 wob = (hash22(floor(px / (60.0 * unit)) + frame * 3.1) - 0.5) * 2.2 * unit;
+    float2 wpx = px + wob;
+
+    float3 paper = float3(0.975, 0.96, 0.915);
+    paper *= 0.97 + 0.04 * vnoise2(px / (2.5 * unit)) + 0.02 * vnoise2(px / (40.0 * unit));
+    // notebook rules
+    float ruleDist = 17.0 * unit - abs(fmod(wpx.y + 14.0 * unit, 34.0 * unit) - 17.0 * unit);   // 0 on a ruled line
+    float rule = smoothstep(1.4 * unit, 0.5 * unit, ruleDist);
+    paper = mix(paper, float3(0.70, 0.82, 0.96), rule * 0.28);
+
+    // contour lines: depth jumps and picture edges, sampled with a wobbly offset
+    float2 o = (2.0 * unit + 0.9 * unit * hash12(floor(px / (90.0 * unit)) + frame)) / float2(u.resX, u.resY);
+    float2 w = (hash22(floor(px / (50.0 * unit)) + frame * 1.7) - 0.5) * 3.0 * unit / float2(u.resX, u.resY);
+    float z0 = geo.sample(s, ct + w).x;
+    float zx = geo.sample(s, ct + w + float2(o.x, 0)).x, zy = geo.sample(s, ct + w + float2(0, o.y)).x;
+    float zx2 = geo.sample(s, ct + w - float2(o.x, 0)).x, zy2 = geo.sample(s, ct + w - float2(0, o.y)).x;
+    float dz = max(max(abs(zx - z0), abs(zx2 - z0)), max(abs(zy - z0), abs(zy2 - z0))) / max(z0, 0.1);
+    float contourZ = smoothstep(0.045, 0.09, dz);
+    float contourL = smoothstep(0.09, 0.22, sf.lumEdge * 0.3) * 0.75;
+    float contour = max(contourZ, contourL);
+
+    // hatching: darker tone, more layers
+    float d = saturate((1.0 - tone) * 1.5 - 0.42);
+    float pitch = 6.5 * unit;
+    float n1 = 0.35 * vnoise2(wpx / (28.0 * unit)) - 0.17;
+    float h1 = hatchLine((wpx.x + wpx.y) / (pitch * 1.414) + n1, 0.14 + 0.2 * d) * smoothstep(0.08, 0.2, d);
+    float h2 = hatchLine((wpx.x - wpx.y) / (pitch * 1.414) + n1 * 1.3, 0.14 + 0.2 * d) * smoothstep(0.38, 0.5, d);
+    float h3 = hatchLine((wpx.y) / (pitch * 0.9) + n1, 0.16 + 0.2 * d) * smoothstep(0.7, 0.85, d);
+    float ink = saturate(max(contour, max(h1, max(h2, h3))));
+    ink *= 0.86 + 0.14 * vnoise2(px / (1.6 * unit));                 // ballpoint pressure
+    float3 inkColor = float3(0.07, 0.09, 0.22);
+    return mix(paper, inkColor, ink);
+}
+
+// ---------------------------------------------------------------------------
+
+// A material look at a screen position, as scene-linear colour (before tone mapping).
+static float3 materialColor(float2 uv, float styleID, constant Uniforms& u,
+                            texture2d<float> lum, texture2d<float> geo, sampler s)
+{
+    float2 res = float2(u.resX, u.resY);
+    float2 px = uv * res;
+    float2 cd = dispUV(uv, u);
+    float2 ct = texUV(cd, u);
+
+    // --- geometry
+    float4 gd = geo.sample(s, ct);
+    float3 ng = float3(gd.y, gd.z, -sqrt(saturate(1.0 - dot(gd.yz, gd.yz))));
+    if (u.mirror > 0.5) ng.x = -ng.x;
+    ng.xy *= (styleID == 2.0 ? 1.8 : 1.5);              // exaggerate relief a little: depth maps are shallow
+    float z = mix(u.zRef, max(gd.x, 0.05), u.depthFade);
+    ng = normalize(mix(float3(0.0, 0.0, -1.0), normalize(ng), u.depthFade));
+    float3 P = rayAt(cd, u) * z;
+
+    // --- fine relief from the picture itself
+    float mean = lum.sample(s, float2(0.5), level(14.0)).r;
+    float gain = clamp(0.40 / max(mean, 0.02), 0.7, 5.0) * u.exposure;
+    float2 o = 5.0 * max(u.resY / 1200.0, 1.0) / res;
+    float L = lum.sample(s, uv, level(1.0)).r;
+    float gx = lum.sample(s, uv + float2(o.x, 0.0), level(1.0)).r - lum.sample(s, uv - float2(o.x, 0.0), level(1.0)).r;
+    float gy = lum.sample(s, uv + float2(0.0, o.y), level(1.0)).r - lum.sample(s, uv - float2(0.0, o.y), level(1.0)).r;
+    float bump = (styleID == 1.0 ? 1.1 : (styleID == 2.0 ? 0.4 : 0.8)) * gain;
+    float3 n = normalize(ng + float3(-gx * bump * 2.2, -gy * bump * 2.2, 0.0));
+
+    // --- crevices: compare this depth with the surroundings
+    float2 gs = 1.0 / float2(geo.get_width(), geo.get_height());
+    float zAvg = 0.0;
+    const float2 dirs[8] = { float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
+                             float2(0.7, 0.7), float2(-0.7, 0.7), float2(0.7, -0.7), float2(-0.7, -0.7) };
+    for (int i = 0; i < 8; i++) zAvg += geo.sample(s, ct + dirs[i] * gs * 9.0).x;
+    zAvg /= 8.0;
+    float cav = clamp((zAvg - gd.x) / (0.06 * max(gd.x, 0.2)), -1.0, 1.0) * u.depthFade;
+
+    Surf sf;
+    sf.P = P;
+    sf.n = n;
+    sf.I = normalize(P);
+    sf.z = z;
+    sf.L = clamp((L * gain - 0.42) * u.contrast + 0.42, 0.0, 1.5);
+    sf.cav = cav;
+    sf.ao = 1.0 + min(cav, 0.0) * 0.8;
+    sf.lumEdge = length(float2(gx, gy)) * gain * 2.2 * 1.0;
+    sf.depthEdge = gd.w * u.depthFade;
+    sf.pitch = fwidth(P.y / 0.0021);
+
+    float3 col;
+    if (styleID < 1.5) col = shadeChrome(sf, u);
+    else if (styleID < 2.5) col = shadeQuartz(sf, u);
+    else if (styleID < 3.5) col = shadeCopper(sf, u);
+    else if (styleID < 4.5) col = shadeBronze(sf, u);
+    else if (styleID < 5.5) {
+        float tone = 0.5 + 0.5 * dot(n, keyLight(u.time));
+        tone = mix(tone, saturate(sf.L), 0.45) * (0.65 + 0.35 * sf.ao);
+        col = shadeDoodle(uv, sf, tone, geo, lum, u, s, ct);
+    }
+    else col = shadePlastic(sf, u);
+
+    // silhouettes get a soft bright edge on the metals so figures separate from their background
+    if (styleID < 1.5) col += float3(0.5, 0.7, 1.0) * sf.depthEdge * 0.22;
+
+    return col;
+}
+
+fragment float4 materialFS(VOut in [[stage_in]],
+                           texture2d<float> lum [[texture(0)]],
+                           texture2d<float> cam [[texture(2)]],
+                           texture2d<float> geo [[texture(3)]],
+                           texture2d<float> space [[texture(4)]],
+                           texture2d<float> mask [[texture(5)]],
+                           constant Uniforms& u [[buffer(0)]],
+                           sampler s [[sampler(0)]])
+{
+    float3 col = materialColor(in.uv, u.style, u, lum, geo, s);
+    float2 px = in.uv * float2(u.resX, u.resY);
+    float2 ct = texUV(dispUV(in.uv, u), u);
+    float3 bg = u.spaceOn > 0.5 ? space.sample(s, in.uv).rgb : float3(0.0);
+    float fg = subjectFG(mask, ct, u, s);
+    float3 styled = mix(bg, col, fg * u.camFade);
+
+    // --- matrix-style wipe when the look is switched on/off with Space
+    float2 cs = float2(u.cellH * u.cellAspect, u.cellH);
+    float2 rv = reveal(floor(px / cs), u.resY / u.cellH, u);
+    float3 raw = cam.sample(s, ct).rgb * u.camFade;
+    float3 outc = mix(raw, styled, rv.x);
+    outc = mix(outc, float3(0.85, 1.0, 0.9) * 2.0, rv.y * 0.6);
+    return float4(outc, max(rv.x, rv.y));
+}

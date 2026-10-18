@@ -1,0 +1,5 @@
+/Matrix Eyes Cam.app/
+/build/
+/MatrixEyesCam.xcodeproj/
+Signing.local.xcconfig
+.DS_Store

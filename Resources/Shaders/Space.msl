@@ -1,0 +1,199 @@
+// Outer space: a dense starfield and an optional black hole.
+// The black hole is ray-traced: every pixel's light ray is bent through the Schwarzschild
+// geometry (units: Schwarzschild radius = 1), so the stars behind it are lensed, and the
+// accretion disk appears both directly and as the arch warped over and under the shadow.
+// Concatenated after Shaders.metal, which provides Uniforms, VOut and the hash helpers.
+
+static float2 hash22(float2 p) {
+    float3 p3 = fract(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+static float hash13(float3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.zyx + 31.32);
+    return fract((p.x + p.y) * p.z);
+}
+
+static float vnoise2(float2 p) {
+    float2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash12(i), hash12(i + float2(1, 0)), f.x),
+               mix(hash12(i + float2(0, 1)), hash12(i + float2(1, 1)), f.x), f.y);
+}
+
+static float fbm2(float2 p) {
+    float a = 0.5, s = 0.0;
+    for (int i = 0; i < 4; i++) { s += a * vnoise2(p); p = p * 2.03 + 17.1; a *= 0.5; }
+    return s;
+}
+
+static float3 starTint(float h) {
+    // Mostly white, some blue-white and some warm, like real stars.
+    return mix(mix(float3(0.65, 0.78, 1.0), float3(1.0, 1.0, 1.0), smoothstep(0.0, 0.45, h)),
+               float3(1.0, 0.82, 0.62), smoothstep(0.7, 1.0, h));
+}
+
+// Stars on the sphere of directions. `pxAng` is the angle one screen pixel covers, so even
+// the faintest star is at least a pixel wide and never shimmers or vanishes.
+static float3 starfield(float3 d, float time, float pxAng) {
+    float lon = atan2(d.x, d.z);
+    float lat = asin(clamp(d.y, -1.0, 1.0));
+    float2 ang = float2(lon * cos(lat), lat);
+    float3 col = float3(0.0);
+
+    // Faint haze, barely there.
+    col += float3(0.18, 0.22, 0.45) * vnoise2(ang * 2.4 + 3.0) * vnoise2(ang * 0.9 - 9.0) * 0.05;
+
+    // Three layers: a dense dust of faint stars, medium ones, and a few bright ones with glow.
+    const float scale[3] = { 150.0, 62.0, 17.0 };
+    const float density[3] = { 0.40, 0.30, 0.20 };
+    for (int k = 0; k < 2; k++) {
+        float2 p = ang * scale[k];
+        float2 cell = floor(p);
+        float2 h = hash22(cell + float(k) * 41.0);
+        float exists = step(1.0 - density[k], hash12(cell * 1.7 + float(k) * 13.0));
+        float2 centre = 0.18 + 0.64 * h;
+        float2 dd = (fract(p) - centre) / scale[k];
+        float sig = max(pxAng * 0.62, 0.00035 * (1.0 + float(k)));
+        float b = pow(hash12(cell + 91.0 + float(k)), k == 0 ? 3.2 : 2.2) * (k == 0 ? 0.9 : 1.3) + 0.12;
+        float tw = 0.82 + 0.18 * sin(time * (0.8 + 3.0 * h.x) + h.y * 40.0);
+        col += starTint(hash12(cell + 5.0)) * exists * b * tw * exp(-dot(dd, dd) / (2.0 * sig * sig));
+    }
+    {   // bright stars. Centres sit in the middle of their cell and glow/spikes stay inside it, so one cell is enough.
+        float2 p = ang * scale[2];
+        float2 cell = floor(p);
+        if (step(1.0 - density[2], hash12(cell * 2.3 + 29.0)) > 0.5) {
+            float2 h = hash22(cell + 77.0);
+            float2 centre = 0.3 + 0.4 * h;
+            float2 dd = (p - cell - centre) / scale[2];
+            float r2 = dot(dd, dd);
+            float sig = max(pxAng * 0.9, 0.0011);
+            float b = 1.2 + 4.0 * pow(hash12(cell + 61.0), 3.0);
+            float tw = 0.85 + 0.15 * sin(time * (0.5 + 2.0 * h.y) + h.x * 30.0);
+            float3 tint = starTint(hash12(cell + 8.0));
+            float core = exp(-r2 / (2.0 * sig * sig));
+            float glow = 0.0016 / (r2 * 3000.0 + 1.0) * b;
+            // four-point diffraction spikes on the brightest
+            float spike = 0.0;
+            if (hash12(cell + 3.0) > 0.55) {
+                float L = 0.011 * (0.6 + 0.8 * hash12(cell + 6.0));
+                float w = pxAng * 0.8;
+                spike = (exp(-abs(dd.x) / L) * exp(-abs(dd.y) / w) + exp(-abs(dd.y) / L) * exp(-abs(dd.x) / w)) * 0.35;
+            }
+            col += tint * (core * b + glow + spike * b) * tw;
+        }
+    }
+    return col;
+}
+
+static float3 diskGradient(float heat) {
+    // cool orange-red -> orange -> pale yellow -> blue-white, as the gas gets hotter
+    float3 c = mix(float3(0.9, 0.18, 0.03), float3(1.0, 0.55, 0.2), smoothstep(0.0, 0.35, heat));
+    c = mix(c, float3(1.0, 0.86, 0.62), smoothstep(0.3, 0.7, heat));
+    return mix(c, float3(0.85, 0.92, 1.0), smoothstep(0.7, 1.2, heat));
+}
+
+// Light from the black hole's disk and sky for one ray. `emit` accumulates disk light.
+static float3 blackHoleRay(float3 C, float3 rd, float time, float pxAng, thread float3& dirOut, thread float& skyMask) {
+    const float rIn = 2.7, rOut = 8.0;
+    float3 pos = C, vel = rd;
+    float3 l = cross(pos, vel);
+    float h2 = dot(l, l);
+    float3 emit = float3(0.0);
+    float trans = 1.0;
+    bool captured = false;
+    for (int i = 0; i < 280; i++) {
+        float r2 = dot(pos, pos);
+        float r = sqrt(r2);
+        if (r < 1.0) { captured = true; break; }
+        if (r > 45.0 && dot(pos, vel) > 0.0) break;
+        float dt = clamp(0.05 * r, 0.04, 1.3);
+        vel = normalize(vel + (-1.5 * h2 / (r2 * r2 * r)) * pos * dt);
+        float3 np = pos + vel * dt;
+        if (pos.y * np.y < 0.0) {                       // crossed the disk plane
+            float tt = pos.y / (pos.y - np.y);
+            float3 hit = mix(pos, np, tt);
+            float rr = length(hit.xz);
+            if (rr > rIn * 0.92 && rr < rOut) {
+                float ang = atan2(hit.z, hit.x);
+                float beta = sqrt(0.5 / rr);
+                float3 tangent = normalize(float3(-hit.z, 0.0, hit.x));
+                float dop = 1.0 / (rsqrt(1.0 - beta * beta) * (1.0 - beta * dot(tangent, -vel)));
+                float grav = sqrt(max(1.0 - 1.0 / rr, 0.05));
+                float g = dop * grav;
+                float prof = pow(rIn / rr, 1.7) * smoothstep(rOut, rOut * 0.55, rr) * smoothstep(rIn * 0.92, rIn * 1.12, rr);
+                float rot = ang + time * 0.35 / pow(rr / rIn, 1.5);
+                float tur = 0.45 + 1.1 * fbm2(float2(rot * 3.2, rr * 2.4));
+                tur *= 0.85 + 0.15 * sin(rr * 26.0 + fbm2(float2(rot * 2.0, rr)) * 6.0);
+                float I = prof * tur * pow(g, 3.0) * 3.4;
+                float heat = clamp(pow(g, 0.9) * pow(rIn / rr, 0.45) * 0.78, 0.0, 1.4);
+                emit += trans * diskGradient(heat) * I;
+                trans *= 0.32;
+            }
+        }
+        pos = np;
+    }
+    dirOut = normalize(vel);
+    skyMask = captured ? 0.0 : trans;
+    return emit;
+}
+
+// Space as seen through the screen. `head` (about -1..1) moves the virtual camera for parallax.
+static float3 spaceAt(float2 uv, float2 head, constant Uniforms& u)
+{
+    float aspect = u.resX / u.resY;
+    float tanV = u.bhTanV;
+    float pxAng = 2.0 * tanV / u.resY;
+    float t = u.time;
+
+    // The camera looks at the black hole from slightly above its disk; the hole sits at (bhX, bhY).
+    float2 bh = float2(u.bhX + 0.012 * sin(t * 0.07), u.bhY + 0.008 * sin(t * 0.05 + 1.0));
+    float2 offs = float2((uv.x - bh.x) * aspect, bh.y - uv.y) * 2.0 * tanV;
+    float elev = u.bhElev + 0.025 * sin(t * 0.11);
+    const float D = 25.0;
+    float3 C = D * float3(0.0, sin(elev), -cos(elev));
+    float3 f = normalize(-C);
+    float3 right = normalize(cross(float3(0.0, 1.0, 0.0), f));
+    float3 up = cross(f, right);
+    // Moving the camera (not its aim) with your head: the hole shifts against the far stars.
+    C += (right * head.x + up * head.y) * 2.2;
+    float3 rd = normalize(f + offs.x * right + offs.y * up);
+
+    float3 dir = rd, emit = float3(0.0);
+    float sky = 1.0;
+    if (u.bhOn > 0.5) {
+        float b = length(cross(C, rd));
+        const float bTrace = 9.5, bBlend = 7.0;
+        float3 traced = rd;
+        if (b < bTrace) {
+            float skyT;
+            emit = blackHoleRay(C, rd, t, pxAng, traced, skyT);
+            sky = skyT;
+            emit *= 1.0 - smoothstep(8.2, bTrace, b);
+        }
+        if (b > bBlend && dot(C, rd) < 0.0) {
+            // Far from the hole: weak-field bending (series in 1/b), blended into the traced rays.
+            float3 closest = C - dot(C, rd) * rd;
+            float alpha = 2.0 / b + 2.945 / (b * b) + 5.33 / (b * b * b);
+            float3 analytic = normalize(rd - alpha * normalize(closest));
+            dir = b >= bTrace ? analytic : normalize(mix(traced, analytic, smoothstep(bBlend, bTrace, b)));
+        } else {
+            dir = traced;
+        }
+    }
+
+    // The whole sky drifts slowly.
+    float a = t * 0.004;
+    float ca = cos(a), sa = sin(a);
+    float3 skyDir = float3(ca * dir.x + sa * dir.z, dir.y, -sa * dir.x + ca * dir.z);
+    float3 col = starfield(skyDir, t, pxAng) * sky + emit;
+    return col;
+}
+
+fragment float4 spaceFS(VOut in [[stage_in]],
+                        constant Uniforms& u [[buffer(0)]])
+{
+    return float4(spaceAt(in.uv, float2(0.0), u), 1.0);
+}
